@@ -1,5 +1,5 @@
 [package]
-name = "onboarding-server"
+name = "node-onboarding"
 version = "0.1.0"
 edition = "2021"
 
