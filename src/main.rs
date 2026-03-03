@@ -174,7 +174,10 @@ fn sha256_of(input: &str) -> String {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
-    let out = child.wait_with_output().unwrap_or_default();
+    let out = match child.wait_with_output() {     // ← changed line
+        Ok(o) => o,
+        Err(_) => return String::new(),
+    };
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
@@ -1566,7 +1569,7 @@ fn build_manage_html(state: &AppState) -> String {
     let hw_mode    = state.hw_mode.lock().unwrap().clone();
     let channel    = state.channel.lock().unwrap().clone();
     let provider   = state.provider.lock().unwrap().clone();
-    let model      = state.model.lock().unwrap().clone();
+    let _model      = state.model.lock().unwrap().clone();
     let agent_on   = state.agent_enabled.load(Ordering::Relaxed);
     let ssh_keys   = read_ssh_keys();
     let uptime_s   = state.start_time.elapsed().unwrap_or_default().as_secs();
@@ -1591,8 +1594,8 @@ fn build_manage_html(state: &AppState) -> String {
         }).collect()
     };
 
-    let hw_std_sel  = if hw_mode != "WIND_TUNNEL" { " selected" } else { "" };
-    let hw_wt_sel   = if hw_mode == "WIND_TUNNEL" { " selected" } else { "" };
+    let _hw_std_sel  = if hw_mode != "WIND_TUNNEL" { " selected" } else { "" };
+    let _hw_wt_sel   = if hw_mode == "WIND_TUNNEL" { " selected" } else { "" };
     let agent_chk   = if agent_on { " checked" } else { "" };
     let agent_vis   = if agent_on { "" } else { "display:none" };
 
@@ -2074,7 +2077,7 @@ fn handle_submit(
     stream: &mut TcpStream,
     req: &Req,
     state: &AppState,
-    auth_hash: &Arc<Mutex<String>>,
+    _auth_hash: &Arc<Mutex<String>>,
 ) {
     let body = &req.body;
     let node_name   = json_str(body, "nodeName");
