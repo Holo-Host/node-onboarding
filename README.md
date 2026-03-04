@@ -1,6 +1,6 @@
 # node-onboarding
 
-The onboarding and management server that ships inside every Holo Sovereign Node ISO.
+The onboarding and management server that ships inside every Holo Sovereign Node.
 
 It is a single Rust binary with zero external dependencies — no Tokio, no Axum, no serde. It serves a browser UI over plain TCP on port 8080 and handles the full lifecycle of a node: first-time setup, SSH key management, AI agent configuration, hardware mode switching, and binary self-updates pulled from this repository's GitHub Releases.
 
@@ -27,16 +27,17 @@ It is a single Rust binary with zero external dependencies — no Tokio, no Axum
 ```
 holo-host/holo-node-iso          holo-host/node-onboarding
         │                                  │
-        │  bakes the binary into           │  source + release pipeline
-        │  the FCOS image at               │
-        │  build time                      │  GitHub Actions builds two
-        │                                  │  musl-static binaries on
-        ▼                                  │  every version tag
+        │  Butane YAML + build scripts     │  source + release pipeline
+        │                                  │
+        │  ISO contains node-setup.sh,     │  GitHub Actions builds two
+        │  a first-boot shell script       │  musl-static binaries on
+        │                                  │  every version tag
+        ▼                                  │
 ┌─────────────────────┐                    ▼
 │   Holo Node ISO     │       node-onboarding-x86_64
 │                     │       node-onboarding-aarch64
-│  /usr/local/bin/    │
-│  node-onboarding ◄──┼── baked in at ISO build time
+│  node-setup.sh ─────┼──────────────────────────────►  downloaded at first boot
+│  (inlined script)   │
 │                     │
 │  node-onboarding    │   After first boot, the binary
 │  .service (systemd) │   checks GitHub Releases hourly
@@ -44,7 +45,7 @@ holo-host/holo-node-iso          holo-host/node-onboarding
 └─────────────────────┘   without needing a new ISO.
 ```
 
-The ISO build repo (`holo-host/holo-node-iso`) downloads the binary from the latest GitHub Release here and bakes it into the FCOS image. Once a node is running, subsequent updates to this binary are delivered automatically — no new ISO required.
+The binary is **not baked into the ISO**. Instead, the ISO contains `node-setup.sh` — a small bash script that runs once on first boot, downloads the appropriate binary from the latest GitHub Release here, and exits. From that point on, the binary self-updates hourly. No new ISO is required to deliver updates to running nodes.
 
 ---
 
@@ -52,7 +53,9 @@ The ISO build repo (`holo-host/holo-node-iso`) downloads the binary from the lat
 
 ### First boot
 
-On first boot the binary generates a random 12-character password, writes its SHA-256 hash to `/etc/node-onboarding/auth`, and displays the password and the node's local IP address on the HDMI-connected screen (`/dev/tty1`) in large coloured text. The node operator uses that information to open the setup UI in a browser.
+On first boot `node-setup.sh` (part of the ISO) downloads this binary from the latest GitHub Release and installs it to `/usr/local/bin/node-onboarding`. Once installed, `node-onboarding.service` starts.
+
+On startup the binary generates a random 12-character password, writes its SHA-256 hash to `/etc/node-onboarding/auth`, and displays the password and the node's local IP address on the HDMI-connected screen (`/dev/tty1`) in large coloured text. The node operator uses that information to open the setup UI in a browser.
 
 ### Onboarding wizard
 
@@ -87,7 +90,7 @@ A background thread wakes every hour, queries the GitHub Releases API for this r
 ### Prerequisites
 
 - Rust stable (1.75 or newer)
-- For the static musl builds that ship in the ISO: `musl-tools` (`apt install musl-tools`) and the musl targets added to your toolchain
+- For the static musl builds that ship in releases: `musl-tools` (`apt install musl-tools`) and the musl targets added to your toolchain
 
 ```bash
 # Add musl targets (first time only)
@@ -103,7 +106,7 @@ cargo build
 # Open http://localhost:8080
 ```
 
-### Production build (static musl — what goes in the ISO)
+### Production build (static musl — what goes into GitHub Releases)
 
 ```bash
 # x86_64
@@ -142,7 +145,8 @@ cargo run
 
 ```
 node-onboarding/
-├── main.rs                  ← entire server (single file, std-only)
+├── src/
+│   └── main.rs              ← entire server (single file, std-only)
 ├── holo-node.md             ← ZeroClaw skill file, embedded via include_str!
 ├── Cargo.toml
 ├── Cargo.lock
@@ -165,19 +169,19 @@ Every release publishes two binary assets:
 | `node-onboarding-x86_64`      | x86-64 (most hardware)|
 | `node-onboarding-aarch64`     | ARM64 (Raspberry Pi, Apple Silicon VMs) |
 
-**These asset names are load-bearing.** The self-update code in `find_asset_download_url()` searches for them by exact name. Do not rename them.
+**These asset names are load-bearing.** Both the self-update code in `find_asset_download_url()` and the first-boot `node-setup.sh` in `holo-node-iso` search for them by exact name. Do not rename them.
 
 ### Step-by-step release process
 
-1. Make your changes to `main.rs` (and/or `holo-node.md`).
+1. Make your changes to `src/main.rs` (and/or `holo-node.md`).
 
 2. Update the version in **two places** — they must match exactly:
-   - `const VERSION: &str = "5.1.0";` in `main.rs`
+   - `const VERSION: &str = "5.1.0";` in `src/main.rs`
    - `version = "5.1.0"` in `Cargo.toml`
 
 3. Commit:
    ```bash
-   git add main.rs Cargo.toml
+   git add src/main.rs Cargo.toml
    git commit -m "release: v5.1.0 — <one line summary of changes>"
    ```
 
@@ -192,16 +196,12 @@ Every release publishes two binary assets:
 
 6. Running nodes pick up the update within 60 minutes. Operators can trigger it immediately from the `/manage` panel's "Software Update" section.
 
-### What the release workflow does
+### Delivery to nodes
 
-```yaml
-on:
-  push:
-    tags:
-      - 'v*'
-```
+Once a release is published, updates reach nodes in two ways:
 
-It runs a matrix build for both targets, cross-compiles using `musl-tools` and `gcc-aarch64-linux-gnu`, and uses `softprops/action-gh-release` to create the release and attach the assets. See `.github/workflows/release.yml` for the full workflow.
+- **Running nodes** — the hourly self-update check downloads the new binary and restarts the service automatically, within 60 minutes of the release being published.
+- **Freshly provisioned nodes** — `node-setup.sh` always downloads the latest release at first boot, so new nodes get the current version immediately with no ISO rebuild required.
 
 ---
 
@@ -211,7 +211,7 @@ The update logic lives in `check_and_apply_update()` and `spawn_update_checker()
 
 **Flow:**
 1. Background thread sleeps 90 seconds after startup (gives the server time to fully come up), then checks every `UPDATE_INTERVAL_SECS` (3600 = 1 hour).
-2. Hits `https://api.github.com/repos/{UPDATE_REPO}/releases/latest` using `curl` (the server itself doesn't use curl/wget for agent commands but the binary itself can invoke system curl for update checks).
+2. Hits `https://api.github.com/repos/{UPDATE_REPO}/releases/latest`.
 3. Parses `tag_name` from the response and compares `tag_name.trim_start_matches('v')` against the compiled-in `VERSION` const.
 4. If newer: downloads the arch-matched asset (`node-onboarding-x86_64` or `node-onboarding-aarch64`) to `/tmp/node-onboarding-update`.
 5. `chmod +x`, then `fs::rename()` to replace the running binary atomically.
@@ -222,7 +222,7 @@ The update logic lives in `check_and_apply_update()` and `spawn_update_checker()
 UPDATE_REPO=holo-host/node-onboarding   # default; override for forks/testing
 ```
 
-**Rollback:** There is no automatic rollback. If a bad binary is released, publish a new release with a higher version number. The broken binary will attempt to restart, fail (if it panics on startup), and systemd's `Restart=always` will keep retrying — meaning the node will retry the update check as soon as a good release is available, because each restart re-runs the update checker.
+**Rollback:** There is no automatic rollback. If a bad binary is released, publish a new release with a higher version number. The broken binary will attempt to restart, fail (if it panics on startup), and systemd's `Restart=always` will keep retrying — meaning the node will retry the update check as soon as a good release is available.
 
 ---
 
@@ -309,7 +309,7 @@ The server binds to `0.0.0.0:8080`. It is intended to be reachable only on the l
 1. Add a credentials block to the HTML in `build_onboarding_html()` (copy the pattern from the `cr-telegram` div).
 2. Add a case to `build_channel_toml()` that serialises the credentials to TOML.
 3. Add a case to `send_welcome_message()` that posts the welcome message via the channel's API.
-4. Add the channel to the `extract_channel_config()` regex-free parser if the section header differs from the `[channels_config.<name>]` pattern.
+4. Add the channel to the `extract_channel_config()` parser if the section header differs from the `[channels_config.<name>]` pattern.
 5. Test locally; submit a PR.
 
 ---
@@ -320,7 +320,7 @@ This repository is intentionally kept simple. Before contributing, please read t
 
 - **No async runtime.** The server uses `std::thread` for concurrency. Each connection spawns a thread. This is appropriate for a UI that handles at most a handful of simultaneous requests.
 - **No third-party crates.** `std` only. This keeps the binary small, the build reproducible, and the audit surface minimal.
-- **Single file.** `main.rs` contains the entire server. This is a deliberate choice for auditability — an operator should be able to read the entire source in one sitting.
+- **Single file.** `src/main.rs` contains the entire server. This is a deliberate choice for auditability — an operator should be able to read the entire source in one sitting.
 
 Pull requests that introduce dependencies or split the code across multiple files will not be accepted unless there is a very strong reason.
 
