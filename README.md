@@ -1,6 +1,6 @@
 # node-onboarding
 
-The onboarding and management server that ships inside every Holo Sovereign Node.
+The onboarding and management server that ships inside every Holo Node.
 
 It is a single Rust binary with zero external dependencies — no Tokio, no Axum, no serde. It serves a browser UI over plain TCP on port 8080 and handles the full lifecycle of a node: first-time setup, SSH key management, AI agent configuration, hardware mode switching, and binary self-updates pulled from this repository's GitHub Releases.
 
