@@ -174,7 +174,7 @@ fn sha256_of(input: &str) -> String {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
-    let out = child.wait_with_output().unwrap_or_else(|_| std::process::Output { status: std::process::ExitStatus::from_raw(1), stdout: vec![], stderr: vec![] });
+    let out = child.wait_with_output().unwrap_or_else(|_| std::process::Output { status: std::process::ExitStatus::from(1), stdout: vec![], stderr: vec![] });
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
