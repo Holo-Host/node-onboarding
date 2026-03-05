@@ -70,7 +70,7 @@ const SESSION_TTL_SECS: u64 = 86400;     // 24 h
 const UPDATE_INTERVAL_SECS: u64 = 3600;  // 1 h
 
 // ── Embedded zeroclaw skill ────────────────────────────────────────────────────
-const HOLO_NODE_SKILL: &str = include_str!("../holo-node.md");
+const HOLO_NODE_SKILL: &str = include_str!("holo-node.md");
 
 // ── Agent allowed commands — curl and wget removed ────────────────────────────
 const ALLOWED_COMMANDS: &str = concat!(
@@ -174,10 +174,7 @@ fn sha256_of(input: &str) -> String {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
-    let out = match child.wait_with_output() {     // ← changed line
-        Ok(o) => o,
-        Err(_) => return String::new(),
-    };
+    let out = child.wait_with_output().unwrap_or_default();
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
@@ -258,7 +255,14 @@ fn display_password_on_tty(password: &str) {
     if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty1") {
         let _ = tty.write_all(msg.as_bytes());
     }
-    // Always log so it appears on serial console / journal
+    // Write to issue file so password appears above login: prompt on all consoles
+    let issue = format!(
+        "\n\x1b[1;36m╔══════════════════════════════════════════╗\x1b[0m\n         \x1b[1;36m║      HOLO NODE SETUP                     ║\x1b[0m\n         \x1b[1;36m╚══════════════════════════════════════════╝\x1b[0m\n         \x1b[1mURL:\x1b[0m      http://{}:8080\n         \x1b[1mPassword:\x1b[0m \x1b[1;32m{}\x1b[0m\n         \x1b[31m⚠  Write this down — it cannot be recovered.\x1b[0m\n\n",
+        ip, password
+    );
+    let _ = fs::create_dir_all("/run/issue.d");
+    let _ = fs::write("/run/issue.d/51-node-onboarding.issue", issue.as_bytes());
+    // Always log so it appears in journal
     eprintln!(
         "[onboard] *** SETUP PASSWORD: {} | URL: http://{}:8080 ***",
         password, ip
@@ -1329,14 +1333,12 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
       <div id="providerSection" style="display:none">
         <label style="margin-top:0">AI Provider</label>
         <div class="pl">
-          <div class="pb" onclick="sPv('holo',this)"><div class="pi">🜲</div><div><div class="pn">Holo Intelligence Plus</div><div class="pd">Included — no API key needed</div></div></div>
+          <div class="pb sel" onclick="sPv('ollama',this)"><div class="pi">🦙</div><div><div class="pn">Ollama (Local)</div><div class="pd">Private, no API cost</div></div></div>
           <div class="pb" onclick="sPv('google',this)"><div class="pi">✦</div><div><div class="pn">Google Gemini</div><div class="pd">Free tier available</div></div></div>
           <div class="pb" onclick="sPv('anthropic',this)"><div class="pi">◆</div><div><div class="pn">Anthropic Claude</div><div class="pd">Best for reasoning tasks</div></div></div>
           <div class="pb" onclick="sPv('openai',this)"><div class="pi">⬡</div><div><div class="pn">OpenAI</div><div class="pd">GPT-4o, o4-mini</div></div></div>
           <div class="pb" onclick="sPv('openrouter',this)"><div class="pi">⇄</div><div><div class="pn">OpenRouter</div><div class="pd">One key, 300+ models</div></div></div>
-          <div class="pb" onclick="sPv('ollama',this)"><div class="pi">🦙</div><div><div class="pn">Ollama (Local)</div><div class="pd">Private, no API cost</div></div></div>
         </div>
-        <div id="pc-holo" class="pc"><div class="ok-box">✓ No API key required — Holo Intelligence is included.</div></div>
         <div id="pc-google" class="pc">
           <label>Gemini API Key *</label><input type="password" id="pg-key" placeholder="AIzaSy...">
           <div class="hint">Free key at <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com</a></div>
@@ -1428,7 +1430,7 @@ input:checked+.slider:before{{transform:translateX(22px);background:#fff}}
   </div>
 </div>
 <script>
-const S={{ch:null,pv:null,au:null,agent:false}};
+const S={{ch:null,pv:'ollama',au:null,agent:false}};
 const CHN={{telegram:'Telegram',discord:'Discord',slack:'Slack',signal:'Signal',matrix:'Matrix',whatsapp:'WhatsApp'}};
 const PVN={{holo:'Holo Intelligence Plus',google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
 
@@ -1569,7 +1571,7 @@ fn build_manage_html(state: &AppState) -> String {
     let hw_mode    = state.hw_mode.lock().unwrap().clone();
     let channel    = state.channel.lock().unwrap().clone();
     let provider   = state.provider.lock().unwrap().clone();
-    let _model      = state.model.lock().unwrap().clone();
+    let model      = state.model.lock().unwrap().clone();
     let agent_on   = state.agent_enabled.load(Ordering::Relaxed);
     let ssh_keys   = read_ssh_keys();
     let uptime_s   = state.start_time.elapsed().unwrap_or_default().as_secs();
@@ -1594,8 +1596,8 @@ fn build_manage_html(state: &AppState) -> String {
         }).collect()
     };
 
-    let _hw_std_sel  = if hw_mode != "WIND_TUNNEL" { " selected" } else { "" };
-    let _hw_wt_sel   = if hw_mode == "WIND_TUNNEL" { " selected" } else { "" };
+    let hw_std_sel  = if hw_mode != "WIND_TUNNEL" { " selected" } else { "" };
+    let hw_wt_sel   = if hw_mode == "WIND_TUNNEL" { " selected" } else { "" };
     let agent_chk   = if agent_on { " checked" } else { "" };
     let agent_vis   = if agent_on { "" } else { "display:none" };
 
@@ -2077,7 +2079,7 @@ fn handle_submit(
     stream: &mut TcpStream,
     req: &Req,
     state: &AppState,
-    _auth_hash: &Arc<Mutex<String>>,
+    auth_hash: &Arc<Mutex<String>>,
 ) {
     let body = &req.body;
     let node_name   = json_str(body, "nodeName");
