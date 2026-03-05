@@ -56,7 +56,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.0.8";
+const VERSION: &str = "5.0.9";
 const STATE_FILE: &str = "/etc/node-onboarding/state";
 const AUTH_FILE: &str = "/etc/node-onboarding/auth";
 const PROVIDER_FILE: &str = "/etc/node-onboarding/provider";   // chmod 600
