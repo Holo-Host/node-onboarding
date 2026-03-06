@@ -56,7 +56,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.0.12";
+const VERSION: &str = "5.0.13";
 const STATE_FILE: &str = "/etc/node-onboarding/state";
 const AUTH_FILE: &str = "/etc/node-onboarding/auth";
 const PROVIDER_FILE: &str = "/etc/node-onboarding/provider";   // chmod 600
@@ -760,7 +760,7 @@ fn check_and_apply_update(repo: &str) {
         return;
     }
 
-    let tmp = "/tmp/node-onboarding-update";
+    let tmp = "/usr/local/bin/node-onboarding-update";
     eprintln!("[update] Downloading {}", download_url);
     let ok = Command::new("curl")
         .args(["-sfL", "-o", tmp, &download_url])
