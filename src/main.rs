@@ -1824,7 +1824,7 @@ fn build_manage_html(state: &AppState) -> String {
 .section-title{{font-size:14px;font-weight:600;color:#e2e8f0;display:flex;align-items:center;gap:8px}}
 .section-badge{{font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}}
 .badge-green{{background:#0d2618;border:1px solid #166534;color:#86efac}}
-.badge-orange{background:#44250a;color:#fb923c}}
+.badge-orange{{background:#44250a;color:#fb923c}}
 .badge-gray{{background:#1a1d27;border:1px solid #3d4468;color:#64748b}}
 .section-arrow{{color:#475569;font-size:12px}}
 .section-body{{padding:4px 32px 20px;display:none}}
