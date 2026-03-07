@@ -1,4 +1,4 @@
-// Holo Node Manager Server — v5.1.0
+// Holo Node Manager Server — v5.1.1
 //
 // Changes from v5.0.x:
 //   - All 20 channels supported in onboarding and /manage:
@@ -53,7 +53,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.1.0";
+const VERSION: &str = "5.1.1";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -2303,9 +2303,15 @@ fn handle_agent_toggle(
     if enabled {
         // Bug fix v5.1.0: save existing channel config before openclaw onboard
         // (which rewrites config.toml with a fresh skeleton), then reapply after.
-        let channel_config = match fs::read_to_string(OPENCLAW_CONFIG) {
-            Ok(c) => extract_channel_config(&c),
-            Err(_) => String::new(),
+        let (channel_config, autonomy) = match fs::read_to_string(OPENCLAW_CONFIG) {
+            Ok(c) => {
+                let auto = c.lines()
+                    .find(|l| l.trim_start().starts_with("level = "))
+                    .and_then(|l| l.split('"').nth(1))
+                    .unwrap_or("supervised").to_string();
+                (extract_channel_config(&c), auto)
+            },
+            Err(_) => (String::new(), "supervised".to_string()),
         };
 
         // Read provider info
@@ -2328,18 +2334,8 @@ fn handle_agent_toggle(
         }
         write_openclaw_env(&provider, &api_key);
 
-        // Reapply channel config
-        if !channel_config.trim().is_empty() {
-            if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
-                let mut final_config = config;
-                final_config.push('\n');
-                final_config.push_str(&channel_config);
-                let _ = fs::write(OPENCLAW_CONFIG, &final_config);
-                let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
-            }
-        }
-
-        let _ = Command::new("systemctl").args(["start", "openclaw-daemon.service"]).output();
+        // Reapply channel config, patch autonomy, and start agent
+        restart_openclaw_with_channel_config(&channel_config, &autonomy);
     } else {
         let _ = Command::new("systemctl").args(["stop", "openclaw-daemon.service"]).output();
     }
@@ -2369,9 +2365,15 @@ fn handle_provider_swap(
 
     // Bug fix v5.1.0: save existing channel config before openclaw onboard
     // (which rewrites config.toml with a fresh skeleton), then reapply after.
-    let channel_config = match fs::read_to_string(OPENCLAW_CONFIG) {
-        Ok(c) => extract_channel_config(&c),
-        Err(_) => String::new(),
+    let (channel_config, autonomy) = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c) => {
+            let auto = c.lines()
+                .find(|l| l.trim_start().starts_with("level = "))
+                .and_then(|l| l.split('"').nth(1))
+                .unwrap_or("supervised").to_string();
+            (extract_channel_config(&c), auto)
+        },
+        Err(_) => (String::new(), "supervised".to_string()),
     };
 
     if !ensure_openclaw_binary(stream) { return; }
@@ -2381,16 +2383,8 @@ fn handle_provider_swap(
     }
     write_openclaw_env(provider, api_key);
 
-    // Reapply channel config
-    if !channel_config.trim().is_empty() {
-        if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
-            let mut final_config = config;
-            final_config.push('\n');
-            final_config.push_str(&channel_config);
-            let _ = fs::write(OPENCLAW_CONFIG, &final_config);
-            let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
-        }
-    }
+    // Reapply channel config, patch autonomy, and restart agent
+    restart_openclaw_with_channel_config(&channel_config, &autonomy);
 
     // Persist provider info
     let _ = fs::write(PROVIDER_FILE, format!(
@@ -2404,8 +2398,6 @@ fn handle_provider_swap(
     *state.model.lock().unwrap()    = pv_cfg.model.clone();
     update_state_key("provider", provider);
     update_state_key("model", &pv_cfg.model);
-
-    let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
 
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
