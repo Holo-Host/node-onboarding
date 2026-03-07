@@ -2266,7 +2266,6 @@ async function triggerUpdate(){{
         agent_vis         = agent_vis,
         provider_display  = html_escape(&provider_display),
         provider_js       = html_escape(&provider),
-        model_display     = html_escape(&model),
         channel_display   = html_escape(&channel_display),
         hw_mode           = hw_mode,
         hw_mode_display   = hw_mode_display,
