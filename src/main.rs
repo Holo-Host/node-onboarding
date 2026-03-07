@@ -1,22 +1,9 @@
-// Holo Node Manager Server — v5.1.2
+// Holo Node Manager Server — v5.2.0
 //
-// Changes from v5.0.x:
-//   - All 20 channels supported in onboarding and /manage:
-//     CLI, Telegram, Discord, Slack, WhatsApp, Signal, iMessage,
-//     Email, Mattermost, Nextcloud Talk, Linq, Webhook,
-//     Matrix, IRC, Nostr,
-//     DingTalk, QQ, Lark, Feishu
-//   - /manage: new Channels section — add or remove any channel
-//     at any time without re-onboarding.
-//   - New routes: POST /manage/channels/add, POST /manage/channels/remove
-//   - Bug fix: handle_submit checks for /usr/local/bin/openclaw before
-//     calling run_openclaw_onboard; if missing, triggers
-//     openclaw-update.service --wait so onboarding never races the
-//     OnBootSec=10min timer.
-//   - Bug fix: handle_provider_swap and handle_agent_toggle now save
-//     channel config BEFORE run_openclaw_onboard (which overwrites
-//     config.toml with a fresh skeleton), then reapply it after.
-//   - OpenClaw fork abstraction (unchanged from v5.0.x)
+// Changes from v5.1.2:
+//   - /manage: new Autonomy section — view and switch agent autonomy level post-onboarding
+//   - All /manage actions now send confirmation/error notifications to configured chat channels
+//
 //
 // Routes:
 //   GET  /                      → wizard or redirect /manage
@@ -35,6 +22,7 @@
 //   POST /manage/update         → trigger immediate update check
 //   POST /manage/channels/add   → add or replace a channel config
 //   POST /manage/channels/remove → remove a channel config
+//   POST /manage/autonomy → change agent autonomy level
 
 use std::{
     collections::HashMap,
@@ -53,7 +41,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.1.2";
+const VERSION: &str = "5.2.0";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -616,6 +604,52 @@ fn extract_channel_config(config: &str) -> String {
     out
 }
 
+/// Extract a quoted string value from a TOML section.
+/// e.g. extract_toml_value(config, "channels_config.telegram", "bot_token") → "abc123"
+fn extract_toml_value(config: &str, section: &str, key: &str) -> String {
+    let target = format!("[{}]", section);
+    let mut in_section = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t == target { in_section = true; continue; }
+        if in_section && t.starts_with('[') { break; }
+        if in_section && t.starts_with(key) {
+            if let Some(eq) = t.find('=') {
+                let val = t[eq + 1..].trim().trim_matches('"');
+                return val.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Extract a TOML array value as comma-separated string.
+/// e.g. extract_toml_array(config, "channels_config.telegram", "allowed_users") → "123,456"
+fn extract_toml_array_first(config: &str, section: &str, key: &str) -> String {
+    let target = format!("[{}]", section);
+    let mut in_section = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t == target { in_section = true; continue; }
+        if in_section && t.starts_with('[') { break; }
+        if in_section && t.starts_with(key) {
+            if let Some(start) = t.find('[') {
+                if let Some(end) = t.find(']') {
+                    let inner = &t[start + 1..end];
+                    // Return first non-wildcard entry
+                    for item in inner.split(',') {
+                        let item = item.trim().trim_matches('"').trim();
+                        if !item.is_empty() && item != "*" { return item.to_string(); }
+                    }
+                    // If only wildcard, return it
+                    return inner.trim().trim_matches('"').trim().to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Remove a channel section from config.toml by channel name.
 fn remove_channel_from_config(config: &str, channel_name: &str) -> String {
     if channel_name == "cli" {
@@ -804,6 +838,98 @@ fn send_welcome_message(channel: &str, body: &str, hw_mode: &str) {
     }
 }
 
+/// Send a notification message to all configured chat channels.
+/// Reads credentials from config.toml rather than from a request body.
+/// Used by /manage handlers to confirm changes or report errors.
+fn send_manage_notification(message: &str) {
+    let config = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let channels = list_configured_channels(&config);
+    if channels.is_empty() { return; }
+
+    fn je(s: &str) -> String { s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n") }
+    let escaped = je(message);
+
+    for ch in &channels {
+        match ch.as_str() {
+            "telegram" => {
+                let tok = extract_toml_value(&config, "channels_config.telegram", "bot_token");
+                let uid = extract_toml_array_first(&config, "channels_config.telegram", "allowed_users");
+                if tok.is_empty() || uid.is_empty() || uid == "*" { continue; }
+                let payload = format!("{{\"chat_id\":\"{}\",\"text\":\"{}\",\"parse_mode\":\"Markdown\"}}", uid, escaped);
+                let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                    &format!("https://api.telegram.org/bot{}/sendMessage", tok),
+                    "-H", "Content-Type: application/json", "-d", &payload]).output();
+            },
+            "discord" => {
+                let tok = extract_toml_value(&config, "channels_config.discord", "bot_token");
+                let uid = extract_toml_array_first(&config, "channels_config.discord", "allowed_users");
+                if tok.is_empty() || uid.is_empty() || uid == "*" { continue; }
+                let ch_payload = format!("{{\"recipient_id\":\"{}\"}}", uid);
+                let ch_out = Command::new("curl").args(["-sf", "-X", "POST",
+                    "https://discord.com/api/v10/users/@me/channels",
+                    "-H", "Content-Type: application/json",
+                    "-H", &format!("Authorization: Bot {}", tok), "-d", &ch_payload])
+                    .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+                let dm_id = extract_json_str(&ch_out, "id");
+                if dm_id.is_empty() { continue; }
+                let msg = format!("{{\"content\":\"{}\"}}", escaped);
+                let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                    &format!("https://discord.com/api/v10/channels/{}/messages", dm_id),
+                    "-H", "Content-Type: application/json",
+                    "-H", &format!("Authorization: Bot {}", tok), "-d", &msg]).output();
+            },
+            "slack" => {
+                let tok = extract_toml_value(&config, "channels_config.slack", "bot_token");
+                let uid = extract_toml_array_first(&config, "channels_config.slack", "allowed_users");
+                if tok.is_empty() || uid.is_empty() || uid == "*" { continue; }
+                let payload = format!("{{\"channel\":\"{}\",\"text\":\"{}\"}}", uid, escaped);
+                let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                    "https://slack.com/api/chat.postMessage",
+                    "-H", "Content-Type: application/json",
+                    "-H", &format!("Authorization: Bearer {}", tok), "-d", &payload]).output();
+            },
+            "matrix" => {
+                let hs = extract_toml_value(&config, "channels_config.matrix", "homeserver");
+                let token = extract_toml_value(&config, "channels_config.matrix", "access_token");
+                let room = extract_toml_value(&config, "channels_config.matrix", "room_id");
+                if hs.is_empty() || token.is_empty() || room.is_empty() { continue; }
+                let txn_id = random_hex(8);
+                let room_encoded = room.replace('!', "%21").replace(':', "%3A");
+                let url = format!("{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}", hs, room_encoded, txn_id);
+                let payload = format!("{{\"msgtype\":\"m.text\",\"body\":\"{}\"}}", escaped);
+                let _ = Command::new("curl").args(["-sf", "-X", "PUT", &url,
+                    "-H", "Content-Type: application/json",
+                    "-H", &format!("Authorization: Bearer {}", token), "-d", &payload]).output();
+            },
+            "mattermost" => {
+                let base_url = extract_toml_value(&config, "channels_config.mattermost", "url");
+                let tok = extract_toml_value(&config, "channels_config.mattermost", "bot_token");
+                let channel_id = extract_toml_value(&config, "channels_config.mattermost", "channel_id");
+                if base_url.is_empty() || tok.is_empty() || channel_id.is_empty() { continue; }
+                let payload = format!("{{\"channel_id\":\"{}\",\"message\":\"{}\"}}", channel_id, escaped);
+                let _ = Command::new("curl").args(["-sf", "-X", "POST",
+                    &format!("{}/api/v4/posts", base_url),
+                    "-H", "Content-Type: application/json",
+                    "-H", &format!("Authorization: Bearer {}", tok), "-d", &payload]).output();
+            },
+            "cli" => { /* CLI users see changes on next interaction — no push needed */ },
+            other => {
+                eprintln!("[notify] Push notification not yet implemented for channel: {}", other);
+            },
+        }
+    }
+}
+
+/// Fire-and-forget notification on a background thread (so handlers don't block on curl).
+fn notify_async(message: String) {
+    thread::spawn(move || {
+        send_manage_notification(&message);
+    });
+}
+
 // ── Self-update ────────────────────────────────────────────────────────────────
 
 fn check_and_apply_update(repo: &str) {
@@ -855,7 +981,6 @@ struct ProviderConfig { id: String, model: String, key: String }
 
 fn make_provider_config(provider: &str, model: &str, api_key: &str, api_url: &str) -> Option<ProviderConfig> {
     let (id, mdl, key) = match provider {
-        "holo"       => ("custom:https://llm.holo.com/v1".into(), "swiss-ai".into(), "holo-builtin".into()),
         "google"     => ("google".into(), if model.is_empty() { "gemini-2.5-flash".into() } else { model.into() }, api_key.into()),
         "anthropic"  => ("anthropic".into(), if model.is_empty() { "claude-haiku-4-5-20251001".into() } else { model.into() }, api_key.into()),
         "openai"     => ("openai".into(), if model.is_empty() { "gpt-4o-mini".into() } else { model.into() }, api_key.into()),
@@ -1418,7 +1543,7 @@ const CH = {{
 
 // ── JS state ───────────────────────────────────────────────────────────────────
 const S={{agent:false,ch:'',pv:'ollama',au:'operator'}};
-const PVN={{holo:'Holo (built-in)',google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
+const PVN={{google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
 
 // ── Dynamic channel form renderer ─────────────────────────────────────────────
 function renderChForm(ch){{
@@ -1601,6 +1726,26 @@ fn build_manage_html(state: &AppState) -> String {
     let provider  = state.provider.lock().unwrap().clone();
     let model     = state.model.lock().unwrap().clone();
     let agent_on  = state.agent_enabled.load(Ordering::Relaxed);
+    let autonomy = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c) => c.lines()
+            .find(|l| l.trim_start().starts_with("level = "))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("supervised").to_string(),
+        Err(_) => "supervised".to_string(),
+    };
+    let autonomy_display = match autonomy.as_str() {
+        "readonly" => "Read-Only",
+        "full" => "Full Autonomy",
+        _ => "Supervised",
+    };
+    let au_badge_class = match autonomy.as_str() {
+        "readonly" => "badge-gray",
+        "full" => "badge-orange",
+        _ => "badge-green",
+    };
+    let sel_readonly = if autonomy == "readonly" { " sel" } else { "" };
+    let sel_supervised = if autonomy == "supervised" || (autonomy != "readonly" && autonomy != "full") { " sel" } else { "" };
+    let sel_full = if autonomy == "full" { " sel" } else { "" };
     let ssh_keys  = read_ssh_keys();
     let uptime_s  = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip        = get_local_ip();
@@ -1679,6 +1824,7 @@ fn build_manage_html(state: &AppState) -> String {
 .section-title{{font-size:14px;font-weight:600;color:#e2e8f0;display:flex;align-items:center;gap:8px}}
 .section-badge{{font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}}
 .badge-green{{background:#0d2618;border:1px solid #166534;color:#86efac}}
+.badge-orange{background:#44250a;color:#fb923c}
 .badge-gray{{background:#1a1d27;border:1px solid #3d4468;color:#64748b}}
 .section-arrow{{color:#475569;font-size:12px}}
 .section-body{{padding:4px 32px 20px;display:none}}
@@ -1720,7 +1866,7 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
     <div class="info-item">Hardware <span id="info-hw">{hw_mode_display}</span></div>
     <div class="info-item">Channel <span>{channel_display}</span></div>
     <div class="info-item">Provider <span>{provider_display}</span></div>
-    <div class="info-item">Model <span>{model_display}</span></div>
+    <div class="info-item">Autonomy <span>{autonomy_display}</span></div>
   </div>
 
   <!-- SSH KEYS -->
@@ -1753,6 +1899,33 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
       <div id="agentDetails" style="{agent_vis}">
         <div class="info-box" style="margin-top:0">Agent is running. Use the Channels section below to add or remove integrations without re-onboarding, or the Provider section to hot-swap the AI engine.</div>
       </div>
+    </div>
+  </div>
+
+  <!-- AUTONOMY -->
+  <div class="section" id="sec-autonomy-wrap" style="{autonomy_section_vis}">
+    <div class="section-hdr" onclick="toggleSection('au')">
+      <div class="section-title"><span>🎚️</span> Agent Autonomy <span class="section-badge {au_badge_class}" id="badge-au">{autonomy_display}</span></div>
+      <span class="section-arrow" id="arr-au">▼</span>
+    </div>
+    <div class="section-body" id="sec-au">
+      <div class="info-box" style="margin-top:0;margin-bottom:14px">Controls what the AI agent can do without asking first. Changes take effect after an agent restart.</div>
+      <div class="hw-opts" id="au-opts">
+        <div class="hw-opt{sel_readonly}" onclick="selAu('readonly',this)">
+          <div class="hw-opt-name">👁 Read-Only</div>
+          <div class="hw-opt-desc">Observe and answer. Cannot execute commands.</div>
+        </div>
+        <div class="hw-opt{sel_supervised}" onclick="selAu('supervised',this)">
+          <div class="hw-opt-name">✋ Supervised</div>
+          <div class="hw-opt-desc">Plans actions, waits for your approval.</div>
+        </div>
+        <div class="hw-opt{sel_full}" onclick="selAu('full',this)">
+          <div class="hw-opt-name">⚡ Full Autonomy</div>
+          <div class="hw-opt-desc">Acts immediately, notifies after.</div>
+        </div>
+      </div>
+      <div class="fw" id="au-fw" style="display:{au_fw_vis}"><strong>⚠ Full Autonomy</strong> — the agent acts without asking first.<label><input type="checkbox" id="au-fc" onchange="chkAuSave()"> I understand and accept full autonomy</label></div>
+      <div style="margin-top:12px"><button class="btn btn-primary" id="au-save-btn" onclick="saveAutonomy()">Save Autonomy</button></div>
     </div>
   </div>
 
@@ -1811,14 +1984,12 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
     </div>
     <div class="section-body" id="sec-pv">
       <div class="provider-grid">
-        <div class="pcard{sel_holo}" onclick="selPv('holo',this)"><div><div class="pcard-name">🜲 Holo (built-in)</div><div class="pcard-desc">No API key needed</div></div></div>
         <div class="pcard{sel_google}" onclick="selPv('google',this)"><div><div class="pcard-name">✦ Google Gemini</div><div class="pcard-desc">Free tier available</div></div></div>
         <div class="pcard{sel_anthropic}" onclick="selPv('anthropic',this)"><div><div class="pcard-name">◆ Anthropic Claude</div><div class="pcard-desc">Best for reasoning</div></div></div>
         <div class="pcard{sel_openai}" onclick="selPv('openai',this)"><div><div class="pcard-name">⬡ OpenAI</div><div class="pcard-desc">GPT-4o, o4-mini</div></div></div>
         <div class="pcard{sel_openrouter}" onclick="selPv('openrouter',this)"><div><div class="pcard-name">⇄ OpenRouter</div><div class="pcard-desc">300+ models, one key</div></div></div>
         <div class="pcard{sel_ollama}" onclick="selPv('ollama',this)"><div><div class="pcard-name">🦙 Ollama (Local)</div><div class="pcard-desc">Private, no API cost</div></div></div>
       </div>
-      <div id="mp-holo" class="provider-creds{vis_holo}"><div class="info-box" style="margin-top:0">Using built-in Holo LLM endpoint. No configuration needed.</div></div>
       <div id="mp-google" class="provider-creds{vis_google}"><label>Gemini API Key</label><input type="password" id="m-gkey" placeholder="AIzaSy..."><label>Model</label><select id="m-gmdl"><option value="gemini-2.5-flash">gemini-2.5-flash</option><option value="gemini-2.5-pro">gemini-2.5-pro</option><option value="gemini-2.0-flash">gemini-2.0-flash</option></select></div>
       <div id="mp-anthropic" class="provider-creds{vis_anthropic}"><label>Claude API Key</label><input type="password" id="m-akey" placeholder="sk-ant-..."><label>Model</label><select id="m-amdl"><option value="claude-haiku-4-5-20251001">claude-haiku (Fast)</option><option value="claude-sonnet-4-6">claude-sonnet (Recommended)</option></select></div>
       <div id="mp-openai" class="provider-creds{vis_openai}"><label>OpenAI API Key</label><input type="password" id="m-okey" placeholder="sk-..."><label>Model</label><select id="m-omdl"><option value="gpt-4o-mini">gpt-4o-mini</option><option value="gpt-4o">gpt-4o</option><option value="o4-mini">o4-mini</option></select></div>
@@ -1924,6 +2095,8 @@ function toggleAgent(on){{
   document.getElementById('agentDetails').style.display=on?'block':'none';
   document.getElementById('badge-agent').textContent=on?'Enabled':'Disabled';
   document.getElementById('badge-agent').className='section-badge '+(on?'badge-green':'badge-gray');
+  const auSec=document.getElementById('sec-autonomy-wrap');
+  if(auSec)auSec.style.display=on?'':'none';
   api('/manage/agent',{{enabled:on}})
     .then(()=>toast(on?'Agent enabled — restarting…':'Agent disabled',true))
     .catch(e=>toast('Error: '+e.message,false));
@@ -2021,6 +2194,29 @@ function selHw(mode,el){{
   el.classList.add('sel');
 }}
 
+let mAu='{autonomy}';
+function selAu(lvl,el){{
+  mAu=lvl;
+  document.querySelectorAll('#au-opts .hw-opt').forEach(o=>o.classList.remove('sel'));
+  el.classList.add('sel');
+  const fw=document.getElementById('au-fw');
+  fw.style.display=lvl==='full'?'block':'none';
+  if(lvl!=='full')document.getElementById('au-fc').checked=false;
+  chkAuSave();
+}}
+function chkAuSave(){{
+  document.getElementById('au-save-btn').disabled=(mAu==='full'&&!document.getElementById('au-fc').checked);
+}}
+async function saveAutonomy(){{
+  try{{
+    await api('/manage/autonomy',{{level:mAu}});
+    const names={{readonly:'Read-Only',supervised:'Supervised',full:'Full Autonomy'}};
+    document.getElementById('badge-au').textContent=names[mAu]||mAu;
+    document.getElementById('badge-au').className='section-badge '+(mAu==='readonly'?'badge-gray':mAu==='full'?'badge-orange':'badge-green');
+    toast('Autonomy set to '+(names[mAu]||mAu)+' — agent restarting…',true);
+  }}catch(e){{toast('Error: '+e.message,false);}}
+}}
+
 async function saveHardware(){{
   try{{
     await api('/manage/hardware',{{mode:curHw}});
@@ -2076,17 +2272,23 @@ async function triggerUpdate(){{
         hw_mode_display   = hw_mode_display,
         sel_std           = sel_std,
         sel_wt            = sel_wt,
-        sel_holo          = sel_card("holo"),
         sel_google        = sel_card("google"),
         sel_anthropic     = sel_card("anthropic"),
         sel_openai        = sel_card("openai"),
         sel_openrouter    = sel_card("openrouter"),
         sel_ollama        = sel_card("ollama"),
-        vis_holo          = vis("holo"),
         vis_google        = vis("google"),
         vis_anthropic     = vis("anthropic"),
         vis_openai        = vis("openai"),
         vis_openrouter    = vis("openrouter"),
+        autonomy_section_vis = if agent_on { "" } else { "display:none" },
+        au_badge_class    = au_badge_class,
+        autonomy_display  = autonomy_display,
+        sel_readonly      = sel_readonly,
+        sel_supervised    = sel_supervised,
+        sel_full          = sel_full,
+        au_fw_vis         = if autonomy == "full" { "block" } else { "none" },
+        autonomy          = html_escape(&autonomy),
         vis_ollama        = vis("ollama"),
     )
 }
@@ -2109,9 +2311,10 @@ fn handle_submit(
     let model     = json_str(body, "model");
     let api_url   = json_str(body, "apiUrl");
     let hw_mode   = json_str(body, "hwMode");
-    let level     = match json_str(body, "autonomyLevel") {
-        "readonly" | "full" => json_str(body, "autonomyLevel"),
-        _                   => "supervised",
+    let level = match json_str(body, "autonomyLevel") {
+        "operator" | "full"     => "full",
+        "advisor"  | "readonly" => "readonly",
+        _                       => "supervised",
     };
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
@@ -2249,10 +2452,17 @@ fn handle_manage_status(stream: &mut TcpStream, state: &AppState) {
     let keys_json: String = keys.iter()
         .map(|k| format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>().join(",");
+    let autonomy = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c) => c.lines()
+            .find(|l| l.trim_start().starts_with("level = "))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("supervised").to_string(),
+        Err(_) => "supervised".to_string(),
+    };
     send_json_ok(stream, &format!(
-        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","agent_enabled":{},"channel":"{}","provider":"{}","model":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{}}}"#,
+        r#"{{"version":"{}","node_name":"{}","hw_mode":"{}","agent_enabled":{},"channel":"{}","provider":"{}","model":"{}","ssh_key_count":{},"ssh_keys":[{}],"uptime_secs":{},"autonomy":"{}"}}"#,
         VERSION, node_name, hw_mode, agent, channel, provider, model,
-        keys.len(), keys_json, uptime
+        keys.len(), keys_json, uptime, autonomy
     ));
 }
 
@@ -2264,7 +2474,10 @@ fn handle_ssh_add(stream: &mut TcpStream, req: &Req) {
     if keys.iter().any(|k| k == key) { send_json_err(stream, 409, "Key already present"); return; }
     keys.push(key.to_string());
     match write_ssh_keys(&keys) {
-        Ok(()) => send_json_ok(stream, r#"{"status":"added"}"#),
+        Ok(()) => {
+            notify_async("✅ A new SSH key has been added to this node.".to_string());
+            send_json_ok(stream, r#"{"status":"added"}"#);
+        },
         Err(e) => send_json_err(stream, 500, &e),
     }
 }
@@ -2286,7 +2499,10 @@ fn handle_ssh_remove(stream: &mut TcpStream, req: &Req) {
     if idx >= keys.len() { send_json_err(stream, 404, "index out of range"); return; }
     keys.remove(idx);
     match write_ssh_keys(&keys) {
-        Ok(()) => send_json_ok(stream, r#"{"status":"removed"}"#),
+        Ok(()) => {
+            notify_async("✅ An SSH key has been removed from this node.".to_string());
+            send_json_ok(stream, r#"{"status":"removed"}"#);
+        },
         Err(e) => send_json_err(stream, 500, &e),
     }
 }
@@ -2320,8 +2536,7 @@ fn handle_agent_toggle(
         let pv_cfg = match make_provider_config(&provider, &model, &api_key, &api_url) {
             Some(c) => c,
             None => {
-                // Fallback to holo if no provider configured
-                make_provider_config("holo", "", "", "").unwrap()
+                send_json_err(stream, 400, "no valid provider configured"); return;
             }
         };
 
@@ -2340,7 +2555,7 @@ fn handle_agent_toggle(
 
     state.agent_enabled.store(enabled, Ordering::Relaxed);
     update_state_key("agent_enabled", &enabled.to_string());
-
+    notify_async(format!("✅ AI Agent has been *{}*.", if enabled { "enabled" } else { "disabled" }));
     send_json_ok(stream, &format!(r#"{{"status":"ok","agent_enabled":{}}}"#, enabled));
 }
 
@@ -2396,7 +2611,7 @@ fn handle_provider_swap(
     *state.model.lock().unwrap()    = pv_cfg.model.clone();
     update_state_key("provider", provider);
     update_state_key("model", &pv_cfg.model);
-
+    notify_async(format!("✅ AI Provider changed to *{}* (model: {}).", provider, &pv_cfg.model));
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
@@ -2429,7 +2644,7 @@ fn handle_channel_add(
     if state.agent_enabled.load(Ordering::Relaxed) {
         let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
     }
-
+    notify_async(format!("✅ Channel *{}* has been added.", channel_display_name(channel_type)));
     send_json_ok(stream, r#"{"status":"added"}"#);
 }
 
@@ -2467,7 +2682,8 @@ fn handle_channel_remove(
     if state.agent_enabled.load(Ordering::Relaxed) {
         let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
     }
-
+    // Notify on remaining channels (the removed one can no longer receive)
+    notify_async(format!("✅ Channel *{}* has been removed.", channel_display_name(channel)));
     send_json_ok(stream, r#"{"status":"removed"}"#);
 }
 
@@ -2479,7 +2695,61 @@ fn handle_hardware(
     let mode = json_str(&req.body, "mode");
     let mode = if mode == "WIND_TUNNEL" { "WIND_TUNNEL" } else { "STANDARD" };
     apply_hardware_mode(mode, state);
+    let mode_display = if mode == "WIND_TUNNEL" { "Wind Tunnel" } else { "Standard EdgeNode" };
+    notify_async(format!("✅ Hardware mode switched to *{}*.", mode_display));
     send_json_ok(stream, r#"{"status":"ok"}"#);
+}
+
+fn handle_autonomy_change(
+    stream: &mut TcpStream,
+    req: &Req,
+    state: &AppState,
+) {
+    let level = json_str(&req.body, "level");
+    if level != "readonly" && level != "supervised" && level != "full" {
+        send_json_err(stream, 400, "level must be readonly, supervised, or full");
+        return;
+    }
+
+    let display = match level {
+        "readonly"   => "Read-Only",
+        "supervised" => "Supervised",
+        "full"       => "Full Autonomy",
+        _            => level,
+    };
+
+    // Read current config, extract channel config to reapply
+    let config = match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("cannot read config: {}", e);
+            send_json_err(stream, 500, &msg);
+            notify_async(format!("❌ Failed to change autonomy to {}: {}", display, msg));
+            return;
+        }
+    };
+    let channel_config = extract_channel_config(&config);
+
+    // Patch config with new autonomy level
+    let mut final_config = patch_openclaw_config(&config, level);
+    final_config.push('\n');
+    final_config.push_str(&channel_config);
+
+    if let Err(e) = fs::write(OPENCLAW_CONFIG, &final_config) {
+        let msg = format!("failed to write config: {}", e);
+        send_json_err(stream, 500, &msg);
+        notify_async(format!("❌ Failed to change autonomy to {}: {}", display, msg));
+        return;
+    }
+    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+
+    // Restart agent if it's running
+    if state.agent_enabled.load(Ordering::Relaxed) {
+        let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
+    }
+
+    send_json_ok(stream, r#"{"status":"ok"}"#);
+    notify_async(format!("✅ Autonomy level changed to *{}*.", display));
 }
 
 fn handle_password(
@@ -2507,12 +2777,14 @@ fn handle_password(
     let _ = Command::new("chmod").args(["600", AUTH_FILE]).output();
     *auth_hash.lock().unwrap() = new_hash;
 
+    notify_async("✅ The Node Manager password has been changed.".to_string());
     send_json_ok(stream, r#"{"status":"ok"}"#);
 }
 
 fn handle_update(stream: &mut TcpStream) {
     let repo = env::var(UPDATE_REPO_ENV).unwrap_or_else(|_| UPDATE_REPO_DEFAULT.to_string());
     thread::spawn(move || { check_and_apply_update(&repo); });
+    notify_async("ℹ️ A manual software update check has been triggered.".to_string());
     send_json_ok(stream, r#"{"status":"update_triggered"}"#);
 }
 
@@ -2657,6 +2929,14 @@ fn main() {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
                         handle_hardware(&mut stream, &req, &state);
+                    }
+                },
+
+                ("POST", "/manage/autonomy") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_autonomy_change(&mut stream, &req, &state);
                     }
                 },
 

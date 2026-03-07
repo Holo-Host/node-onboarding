@@ -79,6 +79,7 @@ After onboarding, `GET /` redirects to `/manage`. The panel (password-protected)
 - Switch hardware mode between Standard EdgeNode and Wind Tunnel
 - Change the node password
 - Trigger an immediate software update check
+- View and switch the AI agent autonomy level (Read-Only, Supervised, Full Autonomy)
 
 ### Self-update
 
@@ -277,6 +278,7 @@ All nodes update within 60 minutes. On startup after the update, `patch_openclaw
 | `POST` | `/manage/hardware` | session | Switch STANDARD ↔ WIND_TUNNEL |
 | `POST` | `/manage/password` | session | Change node password |
 | `POST` | `/manage/update` | session | Trigger immediate update check |
+| `POST` | `/manage/autonomy` | session | Change agent autonomy level |
 
 Session tokens are stored in-memory and cleared on restart — operators will need to log in again after an update.
 
