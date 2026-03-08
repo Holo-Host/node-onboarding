@@ -1619,14 +1619,13 @@ function sPv(pv,el){{
   chkS3();
 }}
 
-function selAu(lvl, el) {
+function selAu(lvl, el) {{
   S.au = lvl;
   document.querySelectorAll('#au-opts .hw-opt').forEach(b => b.classList.remove('sel'));
   el.classList.add('sel');
-  // Show the security info box for full or supervised; hide for readonly
   document.getElementById('fw').classList.toggle('vis', lvl === 'full' || lvl === 'supervised');
   chkS3();
-}
+}}
 
 function chkS3(){{
   let ok=true;
