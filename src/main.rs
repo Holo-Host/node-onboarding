@@ -1,29 +1,3 @@
-// Holo Node Manager Server — v5.2.1
-//
-// Changes from v5.1.2:
-//   - /manage: new Autonomy section — view and switch agent autonomy level post-onboarding
-//   - All /manage actions now send confirmation/error notifications to configured chat channels
-//
-//
-// Routes:
-//   GET  /                      → wizard or redirect /manage
-//   POST /submit                → run onboarding
-//   GET  /login                 → login page
-//   POST /login                 → authenticate, set session cookie
-//   POST /logout                → clear session
-//   GET  /manage                → management panel (auth required)
-//   GET  /manage/status         → JSON state snapshot (auth required)
-//   POST /manage/ssh/add        → add SSH key
-//   POST /manage/ssh/remove     → remove SSH key by index
-//   POST /manage/agent          → enable/disable agent
-//   POST /manage/provider       → hot-swap provider/model/key
-//   POST /manage/hardware       → switch STANDARD ↔ WIND_TUNNEL
-//   POST /manage/password       → change node password
-//   POST /manage/update         → trigger immediate update check
-//   POST /manage/channels/add   → add or replace a channel config
-//   POST /manage/channels/remove → remove a channel config
-//   POST /manage/autonomy → change agent autonomy level
-
 use std::{
     collections::HashMap,
     env, fs,
@@ -41,7 +15,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.2.1";
+const VERSION: &str = "5.2.2";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -1065,11 +1039,38 @@ fn write_openclaw_env(provider: &str, api_key: &str) {
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 }
 
+fn strip_channel_sections(config: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t == "[channels_config]" || (t.starts_with("[channels_config.") && t.ends_with(']')) {
+            skipping = true;
+            continue;
+        }
+        // Any non-channels_config section header ends the skip
+        if skipping && t.starts_with('[') && !t.starts_with("[[") && !t.starts_with("[channels_config") {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
 fn restart_openclaw_with_channel_config(channel_config: &str, autonomy: &str) {
     if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
-        let mut final_config = patch_openclaw_config(&config, autonomy);
-        final_config.push('\n');
-        final_config.push_str(channel_config);
+        // Strip any channel sections that onboard may have written into the fresh skeleton
+        // to prevent duplicate [channels_config*] headers invalidating the TOML.
+        let stripped = strip_channel_sections(&config);
+        let mut final_config = patch_openclaw_config(&stripped, autonomy);
+        let trimmed_channels = channel_config.trim();
+        if !trimmed_channels.is_empty() {
+            final_config.push('\n');
+            final_config.push_str(trimmed_channels);
+            final_config.push('\n');
+        }
         let _ = fs::write(OPENCLAW_CONFIG, &final_config);
         let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
     }
@@ -1552,7 +1553,7 @@ const CH = {{
 }};
 
 // ── JS state ───────────────────────────────────────────────────────────────────
-const S={agent:false,ch:'',pv:'ollama',au:'full'};
+const S={{agent:false,ch:'',pv:'ollama',au:'full'}};
 const PVN={{google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
 
 // ── Dynamic channel form renderer ─────────────────────────────────────────────
@@ -1618,13 +1619,14 @@ function sPv(pv,el){{
   chkS3();
 }}
 
-function sAu(lvl,el){{
-  S.au=lvl;
-  document.querySelectorAll('.ab').forEach(b=>b.classList.remove('sel'));
+function selAu(lvl, el) {
+  S.au = lvl;
+  document.querySelectorAll('#au-opts .hw-opt').forEach(b => b.classList.remove('sel'));
   el.classList.add('sel');
-  document.getElementById('fw').classList.toggle('vis',lvl==='operator');
+  // Show the security info box for full or supervised; hide for readonly
+  document.getElementById('fw').classList.toggle('vis', lvl === 'full' || lvl === 'supervised');
   chkS3();
-}}
+}
 
 function chkS3(){{
   let ok=true;
@@ -1724,7 +1726,10 @@ async function doSubmit(){{
 </script>
 </body></html>"#,
         css        = COMMON_CSS,
-        wifi_block = wifi_block)
+        wifi_block = wifi_block),
+        sel_full       = " sel",   
+        sel_supervised = "",
+        sel_readonly   = "",
 }
 
 // ── build_manage_html ──────────────────────────────────────────────────────────
@@ -1756,7 +1761,6 @@ fn build_manage_html(state: &AppState) -> String {
     let sel_full       = if autonomy == "full"       { " sel" } else { "" };
     let sel_supervised = if autonomy == "supervised" { " sel" } else { "" };
     let sel_readonly   = if autonomy == "readonly"   { " sel" } else { "" };
-    let sel_advisor = if autonomy == "readonly" { " sel" } else { "" };
     let ssh_keys  = read_ssh_keys();
     let uptime_s  = state.start_time.elapsed().unwrap_or_default().as_secs();
     let ip        = get_local_ip();
@@ -1863,6 +1867,21 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
 .ch-chips{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;min-height:24px}}
 .ch-chip{{display:inline-flex;align-items:center;gap:6px;background:#1a1d27;border:1px solid #2d3148;border-radius:20px;padding:5px 10px 5px 12px;font-size:13px;color:#e2e8f0}}
 .ch-remove{{background:none;border:none;color:#475569;cursor:pointer;font-size:15px;padding:0 0 0 4px;line-height:1}}.ch-remove:hover{{color:#fca5a5}}
+.modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px}}
+.modal{{background:#1a1d27;border:1px solid #2d3148;border-radius:16px;width:100%;max-width:720px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}}
+.modal-hdr{{padding:16px 20px;border-bottom:1px solid #2d3148;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}}
+.modal-hdr h3{{font-size:15px;font-weight:700;color:#e2e8f0}}
+.modal-close{{background:none;border:none;color:#64748b;font-size:22px;cursor:pointer;line-height:1;padding:0}}.modal-close:hover{{color:#e2e8f0}}
+.modal-body{{overflow-y:auto;flex:1}}
+.diff-hunk{{margin-bottom:0}}
+.diff-hunk-hdr{{background:#1e2030;padding:3px 12px;font-size:11px;font-family:monospace;color:#475569;border-top:1px solid #2d3148;border-bottom:1px solid #2d3148}}
+.diff-line{{display:flex;font-size:12px;font-family:monospace;line-height:1.7;padding:0 12px}}
+.diff-line.ctx{{color:#64748b}}.diff-line.add{{background:#0d2618;color:#86efac}}.diff-line.del{{background:#2d1515;color:#fca5a5}}
+.diff-gutter{{width:14px;flex-shrink:0;user-select:none;opacity:.5}}.diff-text{{flex:1;white-space:pre;overflow-x:auto}}
+.cfg-viewer{{background:#0f1117;border-radius:8px;overflow:hidden;margin-bottom:10px;border:1px solid #2d3148}}
+.cfg-pre{{margin:0;padding:14px;font-size:12px;font-family:monospace;color:#94a3b8;max-height:420px;overflow-y:auto;white-space:pre}}
+.cfg-actions{{display:flex;gap:8px;margin-top:8px}}
+.toast-link{{color:#818cf8;background:none;border:none;cursor:pointer;font-size:13px;text-decoration:underline;padding:0;margin-left:10px;font-family:inherit}}
 </style></head><body style="align-items:flex-start;padding:0">
 <div class="card" style="max-width:680px;border-radius:0 0 16px 16px;min-height:100vh">
   <div class="page-hdr">
@@ -1920,16 +1939,20 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
       <span class="section-arrow" id="arr-au">▼</span>
     </div>
     <div class="section-body" id="sec-au">
-     <div class="hw-opts" id="au-opts">
-        <div class="hw-opt{sel_operator}" onclick="selAu('operator',this)">
-          <div class="hw-opt-name">⚡ Operator Autonomy</div>
-          <div class="hw-opt-desc">The human directs their agent who has permission to run the commands required to operate the node.</div>
+     <div class="hw-opts" id="au-opts" style="flex-direction:column">
+        <div class="hw-opt{sel_full}" onclick="selAu('full',this)">
+        <div class="hw-opt-name">⚡ Full</div>
+        <div class="hw-opt-desc">The agent acts autonomously — executes commands and makes decisions without asking for approval first.</div>
         </div>
-        <div class="hw-opt{sel_advisor}" onclick="selAu('advisor',this)">
-          <div class="hw-opt-name">🔒 Advisor Autonomy</div>
-          <div class="hw-opt-desc">The agent has read-only access, and the human chooses which commands to manually execute via SSH.</div>
+        <div class="hw-opt{sel_supervised}" onclick="selAu('supervised',this)">
+        <div class="hw-opt-name">👁 Supervised</div>
+        <div class="hw-opt-desc">The agent proposes actions and waits for your approval before executing anything.</div>
         </div>
-      </div>
+        <div class="hw-opt{sel_readonly}" onclick="selAu('readonly',this)">
+        <div class="hw-opt-name">🔒 Read-Only</div>
+        <div class="hw-opt-desc">The agent has read-only access — it can observe and advise but cannot run any commands.</div>
+        </div>
+        </div>
       <div class="info-box" id="au-info" style="margin-top:0;background:#0f1f2e;border-color:#1e3a5f;color:#93c5fd;display:{au_info_vis}"><strong>🛡 Risk surface is well contained.</strong> A strict command allowlist is already enforced — <code>curl</code> and <code>wget</code> are blocked. The agent can only write inside <code>/var/lib/zeroclaw/workspace</code> (enforced by <code>allowed_roots</code>) and cannot touch system files (enforced by <code>forbidden_paths</code>).</div>
       <div style="margin-top:12px"><button class="btn btn-primary" id="au-save-btn" onclick="saveAutonomy()">Save Autonomy</button></div>
     </div>
@@ -2053,8 +2076,31 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
       <div id="upd-msg" style="margin-top:10px;font-size:13px;color:#64748b;display:none"></div>
     </div>
   </div>
+<!-- RAW CONFIG -->
+  <div class="section">
+    <div class="section-hdr" onclick="loadCfgSection()">
+      <div class="section-title"><span>📄</span> Raw Config</div>
+      <span class="section-arrow" id="arr-cfg">▶</span>
+    </div>
+    <div class="section-body" id="sec-cfg">
+      <div class="cfg-viewer"><pre class="cfg-pre" id="cfg-pre">Loading…</pre></div>
+      <div class="cfg-actions">
+        <button class="btn btn-secondary" onclick="copyCfg()">Copy</button>
+        <a id="cfg-dl" href="/manage/config" download="config.toml" class="btn btn-secondary">Download</a>
+        <button class="btn btn-secondary" onclick="fetchCfg()">↺ Refresh</button>
+      </div>
+    </div>
+  </div>
 </div>
-
+<div class="modal-overlay" id="diff-modal" style="display:none" onclick="if(event.target===this)closeDiff()">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h3>⬅ Config diff</h3>
+      <button class="modal-close" onclick="closeDiff()">✕</button>
+    </div>
+    <div class="modal-body" id="diff-body"></div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 <script>
 let curPv='{provider_js}';
@@ -2070,17 +2116,25 @@ function toggleSection(id){{
 }}
 ['agent','ch','pv','hw','pw','upd'].forEach(id=>toggleSection(id));
 
-function toast(msg,ok){{
+function toast(msg,ok,before,after){{
   const t=document.getElementById('toast');
-  t.textContent=msg;t.className='toast '+(ok?'ok':'err')+' vis';
-  clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('vis'),3000);
+  t.innerHTML='';
+  const span=document.createElement('span');span.textContent=msg;t.appendChild(span);
+  if(ok&&before!==undefined&&after!==undefined&&before!==after){{
+    const btn=document.createElement('button');
+    btn.className='toast-link';btn.textContent='View diff';
+    btn.onclick=()=>openDiff(before,after);
+    t.appendChild(btn);
+  }}
+  t.className='toast '+(ok?'ok':'err')+' vis';
+  clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('vis'),4000);
 }}
 
 async function api(path,payload){{
   const r=await fetch(path,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
   const text=await r.text();
   if(!r.ok)throw new Error(text||'Server error '+r.status);
-  return text;
+  try{{return JSON.parse(text);}}catch{{return {{}};}}
 }}
 
 function v(id){{const e=document.getElementById(id);return e?e.value.trim():'';}}
@@ -2104,7 +2158,7 @@ function toggleAgent(on){{
   const auSec=document.getElementById('sec-autonomy-wrap');
   if(auSec)auSec.style.display=on?'':'none';
   api('/manage/agent',{{enabled:on}})
-    .then(()=>toast(on?'Agent enabled — restarting…':'Agent disabled',true))
+    .then(d=>toast(on?'Agent enabled — restarting…':'Agent disabled',true,d.diff_before,d.diff_after))
     .catch(e=>toast('Error: '+e.message,false));
 }}
 
@@ -2157,8 +2211,8 @@ async function addCh(){{
   const payload={{channel_type:t}};
   if(CH_F[t]){{for(const f of CH_F[t])payload[f.id]=(document.getElementById('nf_'+f.id)||{{}}).value||'';}}
   try{{
-    await api('/manage/channels/add',payload);
-    toast('Channel added — agent restarting…',true);
+    const d=await api('/manage/channels/add',payload);
+    toast('Channel added — agent restarting…',true,d.diff_before,d.diff_after);
     setTimeout(()=>location.reload(),1200);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
@@ -2166,8 +2220,8 @@ async function addCh(){{
 async function removeCh(name){{
   if(!confirm('Remove '+name+' channel? The agent will restart.'))return;
   try{{
-    await api('/manage/channels/remove',{{channel:name}});
-    toast('Channel removed — agent restarting…',true);
+    const d=await api('/manage/channels/remove',{{channel:name}});
+    toast('Channel removed — agent restarting…',true,d.diff_before,d.diff_after);
     setTimeout(()=>location.reload(),1200);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
@@ -2188,8 +2242,8 @@ async function saveProvider(){{
   else if(curPv==='openrouter'){{key=v('m-rkey');model=v('m-rmdl');}}
   else if(curPv==='ollama'){{apiUrl=v('m-lurl');model=v('m-lmdl');}}
   try{{
-    await api('/manage/provider',{{provider:curPv,model,apiKey:key,apiUrl}});
-    toast('Provider updated — agent restarting…',true);
+    const d=await api('/manage/provider',{{provider:curPv,model,apiKey:key,apiUrl}});
+    toast('Provider updated — agent restarting…',true,d.diff_before,d.diff_after);
     setTimeout(()=>location.reload(),1500);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
@@ -2209,11 +2263,11 @@ function selAu(lvl,el){{
 async function saveAutonomy(){{
   const nameMap={{full:'Full',supervised:'Supervised',readonly:'Read-Only'}};
   try{{
-    await api('/manage/autonomy',{{level:mAu}});
+    const d=await api('/manage/autonomy',{{level:mAu}});
     document.getElementById('badge-au').textContent=nameMap[mAu]||mAu;
     document.getElementById('badge-au').className='section-badge '+
       (mAu==='full'?'badge-green':mAu==='supervised'?'badge-orange':'badge-gray');
-    toast('Autonomy set to '+(nameMap[mAu]||mAu)+' — agent restarting…',true);
+    toast('Autonomy set to '+(nameMap[mAu]||mAu)+' — agent restarting…',true,d.diff_before,d.diff_after);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
 
@@ -2235,6 +2289,89 @@ async function changePassword(){{
     ['pw-cur','pw-new','pw-cfm'].forEach(id=>document.getElementById(id).value='');
     toast('Password updated',true);
   }}catch(e){{toast('Error: '+e.message,false);}}
+}}
+
+// ── Diff engine ───────────────────────────────────────────────────────────────
+function escHtml(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+
+function computeDiff(before,after){{
+  const a=before.split('\n'),b=after.split('\n');
+  const n=a.length,m=b.length;
+  const dp=Array.from({{length:n+1}},()=>new Int32Array(m+1));
+  for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)
+    dp[i][j]=a[i]===b[j]?dp[i+1][j+1]+1:Math.max(dp[i+1][j],dp[i][j+1]);
+  const ops=[];let i=0,j=0;
+  while(i<n||j<m){{
+    if(i<n&&j<m&&a[i]===b[j]){{ops.push(['=',a[i]]);i++;j++;}}
+    else if(j<m&&(i>=n||dp[i][j+1]>=dp[i+1][j])){{ops.push(['+',b[j]]);j++;}}
+    else{{ops.push(['-',a[i]]);i++;}}
+  }}
+  const CTX=3;
+  const changed=ops.map((o,idx)=>o[0]!=='='?idx:-1).filter(idx=>idx>=0);
+  if(!changed.length)return[];
+  const ranges=[];
+  let rs=Math.max(0,changed[0]-CTX),re=Math.min(ops.length,changed[0]+CTX+1);
+  for(let k=1;k<changed.length;k++){{
+    const ns=Math.max(0,changed[k]-CTX),ne=Math.min(ops.length,changed[k]+CTX+1);
+    if(ns<=re)re=ne;else{{ranges.push([rs,re]);rs=ns;re=ne;}}
+  }}
+  ranges.push([rs,re]);
+  const hunks=[];let al=1,bl=1;
+  for(let q=0;q<ranges[0][0];q++){{const o=ops[q];if(o[0]==='='||o[0]==='-')al++;if(o[0]==='='||o[0]==='+')bl++;}}
+  for(let ri=0;ri<ranges.length;ri++){{
+    const[hs,he]=ranges[ri];
+    const ac=ops.slice(hs,he).filter(o=>o[0]==='='||o[0]==='-').length;
+    const bc=ops.slice(hs,he).filter(o=>o[0]==='='||o[0]==='+').length;
+    const hunk={{header:'@@ -'+al+','+ac+' +'+bl+','+bc+' @@',lines:[]}};
+    for(const[k,text] of ops.slice(hs,he)){{
+      hunk.lines.push({{kind:k==='='?'ctx':k==='-'?'del':'add',text:(k==='='?' ':k==='-'?'-':'+')+text}});
+      if(k==='='||k==='-')al++;if(k==='='||k==='+')bl++;
+    }}
+    hunks.push(hunk);
+    if(ri+1<ranges.length)for(let q=he;q<ranges[ri+1][0];q++){{const o=ops[q];if(o[0]==='='||o[0]==='-')al++;if(o[0]==='='||o[0]==='+')bl++;}}
+  }}
+  return hunks;
+}}
+
+function openDiff(before,after){{
+  const modal=document.getElementById('diff-modal');
+  const body=document.getElementById('diff-body');
+  modal.style.display='flex';
+  const hunks=computeDiff(before,after);
+  if(!hunks.length){{body.innerHTML='<div style="padding:20px;color:#64748b;font-size:13px">No config changes detected.</div>';return;}}
+  let html='';
+  for(const h of hunks){{
+    html+='<div class="diff-hunk"><div class="diff-hunk-hdr">'+escHtml(h.header)+'</div>';
+    for(const l of h.lines){{
+      html+='<div class="diff-line '+l.kind+'"><span class="diff-gutter">'+escHtml(l.text[0])+'</span><span class="diff-text">'+escHtml(l.text.slice(1))+'</span></div>';
+    }}
+    html+='</div>';
+  }}
+  body.innerHTML=html;
+}}
+function closeDiff(){{document.getElementById('diff-modal').style.display='none';}}
+
+// ── Raw config viewer ─────────────────────────────────────────────────────────
+let cfgLoaded=false;
+function loadCfgSection(){{
+  toggleSection('cfg');
+  const open=document.getElementById('sec-cfg').style.display==='block';
+  if(open&&!cfgLoaded){{fetchCfg();cfgLoaded=true;}}
+}}
+async function fetchCfg(){{
+  const pre=document.getElementById('cfg-pre');
+  pre.textContent='Loading…';
+  try{{
+    const r=await fetch('/manage/config');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    pre.textContent=await r.text();
+  }}catch(e){{pre.textContent='Error: '+e.message;}}
+}}
+function copyCfg(){{
+  const text=document.getElementById('cfg-pre').textContent;
+  navigator.clipboard.writeText(text)
+    .then(()=>toast('Config copied to clipboard',true))
+    .catch(()=>toast('Copy failed — try the Download button instead',false));
 }}
 
 async function triggerUpdate(){{
@@ -2384,6 +2521,7 @@ fn handle_submit(
         };
         // Build channel TOML; payload uses {channel_type}_{field_id} key names.
         let channel_toml = build_channel_toml(body, channel);
+        let config = strip_channel_sections(&config);
         let mut final_config = patch_openclaw_config(&config, level);
         final_config.push('\n');
         if channel == "cli" {
@@ -2396,6 +2534,7 @@ fn handle_submit(
             send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
         }
         let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+        let after = snapshot_config();
 
         let _ = fs::write(PROVIDER_FILE, format!(
             "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
@@ -2512,7 +2651,9 @@ fn handle_agent_toggle(
     state: &AppState,
 ) {
     let enabled = json_bool(&req.body, "enabled");
+    let before = if enabled { snapshot_config() } else { String::new() };
 
+    let after;
     if enabled {
         // Bug fix v5.1.0: save existing channel config before openclaw onboard
         // (which rewrites config.toml with a fresh skeleton), then reapply after.
@@ -2546,16 +2687,21 @@ fn handle_agent_toggle(
         }
         write_openclaw_env(&provider, &api_key);
 
-        // Reapply channel config, patch autonomy, and start agent
+        // Reapply channel config, patch autonomy, and restart agent
         restart_openclaw_with_channel_config(&channel_config, &autonomy);
+        after = snapshot_config();
     } else {
         let _ = Command::new("systemctl").args(["stop", "openclaw-daemon.service"]).output();
+        after = String::new();
     }
 
     state.agent_enabled.store(enabled, Ordering::Relaxed);
     update_state_key("agent_enabled", &enabled.to_string());
     notify_async(format!("✅ AI Agent has been *{}*.", if enabled { "enabled" } else { "disabled" }));
-    send_json_ok(stream, &format!(r#"{{"status":"ok","agent_enabled":{}}}"#, enabled));
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","agent_enabled":{},"diff_before":"{}","diff_after":"{}"}}"#,
+        enabled, json_escape(&before), json_escape(&after)
+    ));
 }
 
 fn handle_provider_swap(
@@ -2595,8 +2741,13 @@ fn handle_provider_swap(
     }
     write_openclaw_env(provider, api_key);
 
+    let before = snapshot_config();
+
     // Reapply channel config, patch autonomy, and restart agent
     restart_openclaw_with_channel_config(&channel_config, &autonomy);
+    let after = snapshot_config();
+
+    // Persist provider info
 
     // Persist provider info
     let _ = fs::write(PROVIDER_FILE, format!(
@@ -2611,7 +2762,10 @@ fn handle_provider_swap(
     update_state_key("provider", provider);
     update_state_key("model", &pv_cfg.model);
     notify_async(format!("✅ AI Provider changed to *{}* (model: {}).", provider, &pv_cfg.model));
-    send_json_ok(stream, r#"{"status":"ok"}"#);
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","diff_before":"{}","diff_after":"{}"}}"#,
+        json_escape(&before), json_escape(&after)
+    ));
 }
 
 fn handle_channel_add(
@@ -2629,11 +2783,13 @@ fn handle_channel_add(
         Err(e) => { send_json_err(stream, 500, &format!("cannot read config: {}", e)); return; }
     };
 
+    let before = snapshot_config();
     let updated = add_channel_to_config(&config, channel_type, &channel_toml);
     if let Err(e) = fs::write(OPENCLAW_CONFIG, &updated) {
         send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
     }
     let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+    let after = snapshot_config();
 
     // Update state with the first/primary channel
     *state.channel.lock().unwrap() = channel_type.to_string();
@@ -2644,7 +2800,10 @@ fn handle_channel_add(
         let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
     }
     notify_async(format!("✅ Channel *{}* has been added.", channel_display_name(channel_type)));
-    send_json_ok(stream, r#"{"status":"added"}"#);
+    send_json_ok(stream, &format!(
+        r#"{{"status":"added","diff_before":"{}","diff_after":"{}"}}"#,
+        json_escape(&before), json_escape(&after)
+    ));
 }
 
 fn handle_channel_remove(
@@ -2660,11 +2819,13 @@ fn handle_channel_remove(
         Err(e) => { send_json_err(stream, 500, &format!("cannot read config: {}", e)); return; }
     };
 
+    let before = snapshot_config();
     let updated = remove_channel_from_config(&config, channel);
     if let Err(e) = fs::write(OPENCLAW_CONFIG, &updated) {
         send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
     }
     let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+    let after = snapshot_config();
 
     // If we removed the primary channel, update state
     {
@@ -2683,7 +2844,10 @@ fn handle_channel_remove(
     }
     // Notify on remaining channels (the removed one can no longer receive)
     notify_async(format!("✅ Channel *{}* has been removed.", channel_display_name(channel)));
-    send_json_ok(stream, r#"{"status":"removed"}"#);
+    send_json_ok(stream, &format!(
+        r#"{{"status":"removed","diff_before":"{}","diff_after":"{}"}}"#,
+        json_escape(&before), json_escape(&after)
+    ));
 }
 
 fn handle_hardware(
@@ -2730,6 +2894,7 @@ fn handle_autonomy_change(
     // patch_openclaw_config rewrites `level = "..."` in-place and passes channel
     // sections through unchanged — no extract/reappend needed here (unlike the
     // onboard/provider flows that call run_openclaw_onboard which wipes the file).
+    let before = snapshot_config();
     let final_config = patch_openclaw_config(&config, level);
 
     if let Err(e) = fs::write(OPENCLAW_CONFIG, &final_config) {
@@ -2739,13 +2904,17 @@ fn handle_autonomy_change(
         return;
     }
     let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+    let after = snapshot_config();
 
     if state.agent_enabled.load(Ordering::Relaxed) {
         let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
     }
 
-    send_json_ok(stream, r#"{"status":"ok"}"#);
     notify_async(format!("✅ Autonomy level changed to *{}*.", display));
+    send_json_ok(stream, &format!(
+        r#"{{"status":"ok","diff_before":"{}","diff_after":"{}"}}"#,
+        json_escape(&before), json_escape(&after)
+    ));
 }
 
 fn handle_password(
@@ -2801,6 +2970,26 @@ fn read_provider_file() -> (String, String) {
         }
     }
     (api_key, api_url)
+}
+// ── Config snapshot + diff helpers ────────────────────────────────────────────
+
+fn snapshot_config() -> String {
+    fs::read_to_string(OPENCLAW_CONFIG).unwrap_or_default()
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+     .replace('\r', "\\r")
+     .replace('\t', "\\t")
+}
+
+fn handle_config_view(stream: &mut TcpStream) {
+    match fs::read_to_string(OPENCLAW_CONFIG) {
+        Ok(c)  => send_response(stream, 200, "OK", "text/plain; charset=utf-8", c.as_bytes()),
+        Err(e) => send_json_err(stream, 500, &format!("cannot read config: {}", e)),
+    }
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -2965,6 +3154,14 @@ fn main() {
                         send_json_err(&mut stream, 401, "Not authenticated");
                     } else {
                         handle_channel_remove(&mut stream, &req, &state);
+                    }
+                },
+
+                ("GET", "/manage/config") => {
+                    if !is_authenticated(&req, &state) {
+                        send_json_err(&mut stream, 401, "Not authenticated");
+                    } else {
+                        handle_config_view(&mut stream);
                     }
                 },
 
