@@ -1730,6 +1730,7 @@ async function doSubmit(){{
         sel_full       = " sel",   
         sel_supervised = "",
         sel_readonly   = "",
+)
 }
 
 // ── build_manage_html ──────────────────────────────────────────────────────────
