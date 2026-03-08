@@ -15,7 +15,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.2.5";
+const VERSION: &str = "5.2.6";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -1221,6 +1221,14 @@ fn restart_openclaw_with_channel_config(channel_config: &str, autonomy: &str) {
                     final_config.insert_str(insert_at, &format!("{}\n", key_line.trim()));
                 } else {
                     final_config.push_str(&format!("\n[channels_config]\n{}\n", key_line.trim()));
+                }
+            }
+
+            // Ensure cli field is always present (required by ZeroClaw schema)
+            if !final_config.contains("\ncli = true") && !final_config.contains("\ncli=true") {
+                if let Some(pos) = final_config.find("[channels_config]\n") {
+                    let insert_at = pos + "[channels_config]\n".len();
+                    final_config.insert_str(insert_at, "cli = true\n");
                 }
             }
 
@@ -2694,10 +2702,10 @@ fn handle_submit(
         let channel_toml = build_channel_toml(body, channel);
         let config = strip_channel_sections(&config);
         let mut final_config = patch_openclaw_config(&config, level);
-        if channel == "cli" {
-            // CLI requires inject via add_channel_to_config (sets cli=true flag)
-            final_config = add_channel_to_config(&final_config, "cli", "");
-        } else if !channel_toml.trim().is_empty() {
+        // cli is a required field in ZeroClaw's [channels_config] schema —
+        // always inject it, regardless of which channel the user selected.
+        final_config = add_channel_to_config(&final_config, "cli", "");
+        if channel != "cli" && !channel_toml.trim().is_empty() {
             // Insert channel sub-section right after [channels_config] block
             // so they remain contiguous (required by ZeroClaw's parser).
             final_config = insert_after_channels_section(&final_config, &channel_toml);
