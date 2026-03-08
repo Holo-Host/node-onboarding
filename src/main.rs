@@ -15,7 +15,7 @@ use std::{
 
 // ── Version & path constants ───────────────────────────────────────────────────
 
-const VERSION: &str = "5.2.2";
+const VERSION: &str = "5.2.3";
 const STATE_FILE: &str = "/etc/node-manager/state";
 const AUTH_FILE: &str = "/etc/node-manager/auth";
 const PROVIDER_FILE: &str = "/etc/node-manager/provider";
@@ -1039,40 +1039,146 @@ fn write_openclaw_env(provider: &str, api_key: &str) {
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 }
 
+// ── Config safety: backup, validate, rollback ──────────────────────────────────
+
+fn backup_config() {
+    let bak = format!("{}.bak", OPENCLAW_CONFIG);
+    if Path::new(OPENCLAW_CONFIG).exists() {
+        let _ = fs::copy(OPENCLAW_CONFIG, &bak);
+        let _ = Command::new("chmod").args(["600", &bak]).output();
+    }
+}
+
+fn rollback_config() {
+    let bak = format!("{}.bak", OPENCLAW_CONFIG);
+    if Path::new(&bak).exists() {
+        let _ = fs::copy(&bak, OPENCLAW_CONFIG);
+        let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+        eprintln!("[config] Rolled back to {}", bak);
+    }
+}
+
+/// Structural validation — catches duplicate section headers and malformed
+/// headers, which are the class of errors that string-based TOML manipulation
+/// can introduce. This is NOT a full TOML parser.
+fn validate_toml_structure(config: &str) -> Result<(), String> {
+    let mut sections: Vec<String> = Vec::new();
+    for (i, line) in config.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        // Table header (not array-of-tables [[...]])
+        if t.starts_with('[') && !t.starts_with("[[") {
+            if !t.ends_with(']') {
+                return Err(format!("line {}: malformed section header: {}", i + 1, t));
+            }
+            let header = t.to_string();
+            if sections.contains(&header) {
+                return Err(format!("line {}: duplicate section {}", i + 1, header));
+            }
+            sections.push(header);
+        }
+    }
+    Ok(())
+}
+
+/// Write config with validation and rollback. Returns Ok(()) on success,
+/// or Err(message) if validation fails (config is rolled back automatically).
+fn write_validated_config(config: &str) -> Result<(), String> {
+    backup_config();
+    if let Err(e) = validate_toml_structure(config) {
+        rollback_config();
+        return Err(format!("Invalid config: {}. Changes rolled back.", e));
+    }
+    if let Err(e) = fs::write(OPENCLAW_CONFIG, config) {
+        rollback_config();
+        return Err(format!("Failed to write config: {}. Changes rolled back.", e));
+    }
+    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+    Ok(())
+}
+
 fn strip_channel_sections(config: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
-    let mut skipping = false;
+    let mut in_channels_root = false;
+    let mut in_channel_sub = false;
     for line in config.lines() {
         let t = line.trim();
-        if t == "[channels_config]" || (t.starts_with("[channels_config.") && t.ends_with(']')) {
-            skipping = true;
+        if t == "[channels_config]" {
+            // Keep the header, enter root mode to filter channel-specific keys
+            in_channels_root = true;
+            in_channel_sub = false;
+            out.push(line);
             continue;
         }
-        // Any non-channels_config section header ends the skip
-        if skipping && t.starts_with('[') && !t.starts_with("[[") && !t.starts_with("[channels_config") {
-            skipping = false;
+        if t.starts_with("[channels_config.") && t.ends_with(']') {
+            // Sub-channel sections are stripped entirely
+            in_channels_root = false;
+            in_channel_sub = true;
+            continue;
         }
-        if !skipping {
-            out.push(line);
+        if (in_channels_root || in_channel_sub) && t.starts_with('[') && !t.starts_with("[[") && !t.starts_with("[channels_config") {
+            in_channels_root = false;
+            in_channel_sub = false;
         }
+        if in_channel_sub {
+            continue; // skip lines inside [channels_config.*] sub-sections
+        }
+        if in_channels_root {
+            // Inside [channels_config]: strip cli = true (re-appended later)
+            // but preserve other keys like message_timeout_secs
+            if t == "cli = true" || t == "cli=true" { continue; }
+        }
+        out.push(line);
     }
     out.join("\n")
 }
 
 fn restart_openclaw_with_channel_config(channel_config: &str, autonomy: &str) {
     if let Ok(config) = fs::read_to_string(OPENCLAW_CONFIG) {
-        // Strip any channel sections that onboard may have written into the fresh skeleton
-        // to prevent duplicate [channels_config*] headers invalidating the TOML.
+        // Strip channel sub-sections that onboard may have written into the fresh
+        // skeleton; the root [channels_config] header and non-channel keys like
+        // message_timeout_secs are preserved to avoid duplicate headers.
         let stripped = strip_channel_sections(&config);
         let mut final_config = patch_openclaw_config(&stripped, autonomy);
         let trimmed_channels = channel_config.trim();
         if !trimmed_channels.is_empty() {
-            final_config.push('\n');
-            final_config.push_str(trimmed_channels);
-            final_config.push('\n');
+            // The stripped config still has [channels_config] with non-channel keys.
+            // The extracted channel_config starts with [channels_config]\ncli = true.
+            // We need to merge: inject cli = true into the existing section,
+            // then append the sub-sections.
+            for ch_line in trimmed_channels.lines() {
+                let ct = ch_line.trim();
+                // Skip the [channels_config] header — it already exists in final_config
+                if ct == "[channels_config]" { continue; }
+                // cli = true goes under the existing [channels_config] header
+                if ct == "cli = true" || ct == "cli=true" {
+                    // Find the [channels_config] header and insert after it
+                    if let Some(pos) = final_config.find("\n[channels_config]\n") {
+                        let insert_at = pos + "\n[channels_config]\n".len();
+                        final_config.insert_str(insert_at, "cli = true\n");
+                    } else if final_config.contains("[channels_config]") {
+                        // Header might be at start of file (no leading newline)
+                        if let Some(pos) = final_config.find("[channels_config]\n") {
+                            let insert_at = pos + "[channels_config]\n".len();
+                            final_config.insert_str(insert_at, "cli = true\n");
+                        }
+                    } else {
+                        // No [channels_config] at all — append fresh
+                        final_config.push_str("\n[channels_config]\ncli = true\n");
+                    }
+                    continue;
+                }
+                // Sub-section headers and their keys — append at end
+                if ct.starts_with("[channels_config.") || !ct.starts_with('[') {
+                    final_config.push_str(ch_line);
+                    final_config.push('\n');
+                }
+            }
         }
-        let _ = fs::write(OPENCLAW_CONFIG, &final_config);
-        let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
+        match write_validated_config(&final_config) {
+            Ok(()) => {},
+            Err(e) => eprintln!("[config] {}", e),
+        }
     }
     let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
 }
@@ -2083,7 +2189,7 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
       <span class="section-arrow" id="arr-cfg">▶</span>
     </div>
     <div class="section-body" id="sec-cfg">
-      <div class="cfg-viewer"><pre class="cfg-pre" id="cfg-pre">Loading…</pre></div>
+      <div class="info-box" style="margin-top:0;margin-bottom:10px;background:#1a1d27;border-color:#2d3148;color:#64748b;font-size:12px"><strong>About browser warnings:</strong> Your node manager is served over your local network (HTTP). Some browsers may warn when downloading files from HTTP sites — this is safe to ignore. The connection stays on your private network.</div><div class="cfg-viewer"><pre class="cfg-pre" id="cfg-pre">Loading…</pre></div>
       <div class="cfg-actions">
         <button class="btn btn-secondary" onclick="copyCfg()">Copy</button>
         <a id="cfg-dl" href="/manage/config" download="config.toml" class="btn btn-secondary">Download</a>
@@ -2127,7 +2233,8 @@ function toast(msg,ok,before,after){{
     t.appendChild(btn);
   }}
   t.className='toast '+(ok?'ok':'err')+' vis';
-  clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('vis'),4000);
+  const hasDiff=ok&&before!==undefined&&after!==undefined&&before!==after;
+  clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('vis'),hasDiff?7000:4000);
 }}
 
 async function api(path,payload){{
@@ -2369,9 +2476,19 @@ async function fetchCfg(){{
 }}
 function copyCfg(){{
   const text=document.getElementById('cfg-pre').textContent;
-  navigator.clipboard.writeText(text)
-    .then(()=>toast('Config copied to clipboard',true))
-    .catch(()=>toast('Copy failed — try the Download button instead',false));
+  if(navigator.clipboard&&window.isSecureContext){{
+    navigator.clipboard.writeText(text)
+      .then(()=>toast('Config copied to clipboard',true))
+      .catch(()=>fallbackCopy(text));
+  }}else{{fallbackCopy(text);}}
+}}
+function fallbackCopy(text){{
+  const ta=document.createElement('textarea');
+  ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';
+  document.body.appendChild(ta);ta.select();
+  try{{document.execCommand('copy');toast('Config copied to clipboard',true);}}
+  catch{{toast('Copy failed — use the Download button instead',false);}}
+  document.body.removeChild(ta);
 }}
 
 async function triggerUpdate(){{
@@ -2530,10 +2647,9 @@ fn handle_submit(
         } else {
             final_config.push_str(&channel_toml);
         }
-        if let Err(e) = fs::write(OPENCLAW_CONFIG, &final_config) {
-            send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
+        if let Err(e) = write_validated_config(&final_config) {
+            send_json_err(stream, 500, &e); return;
         }
-        let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
 
         let _ = fs::write(PROVIDER_FILE, format!(
             "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
@@ -2784,10 +2900,9 @@ fn handle_channel_add(
 
     let before = snapshot_config();
     let updated = add_channel_to_config(&config, channel_type, &channel_toml);
-    if let Err(e) = fs::write(OPENCLAW_CONFIG, &updated) {
-        send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
+    if let Err(e) = write_validated_config(&updated) {
+        send_json_err(stream, 500, &e); return;
     }
-    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
     let after = snapshot_config();
 
     // Update state with the first/primary channel
@@ -2820,10 +2935,9 @@ fn handle_channel_remove(
 
     let before = snapshot_config();
     let updated = remove_channel_from_config(&config, channel);
-    if let Err(e) = fs::write(OPENCLAW_CONFIG, &updated) {
-        send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
+    if let Err(e) = write_validated_config(&updated) {
+        send_json_err(stream, 500, &e); return;
     }
-    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
     let after = snapshot_config();
 
     // If we removed the primary channel, update state
@@ -2896,13 +3010,11 @@ fn handle_autonomy_change(
     let before = snapshot_config();
     let final_config = patch_openclaw_config(&config, level);
 
-    if let Err(e) = fs::write(OPENCLAW_CONFIG, &final_config) {
-        let msg = format!("failed to write config: {}", e);
-        send_json_err(stream, 500, &msg);
-        notify_async(format!("❌ Failed to change autonomy to {}: {}", display, msg));
+    if let Err(e) = write_validated_config(&final_config) {
+        send_json_err(stream, 500, &e);
+        notify_async(format!("❌ Failed to change autonomy to {}: {}", display, e));
         return;
     }
-    let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
     let after = snapshot_config();
 
     if state.agent_enabled.load(Ordering::Relaxed) {
