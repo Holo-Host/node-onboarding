@@ -1654,7 +1654,7 @@ function bRev(){{
   set('rv-ch',S.agent?(CH[S.ch]?CH[S.ch].name:'—'):'—');
   set('rv-pv',S.agent?(PVN[S.pv]||S.pv||'—'):'—');
   set('rv-md',S.agent?(mdl||'(default)'):'—');
-  set('rv-au', S.agent ? ({full:'Full', supervised:'Supervised', readonly:'Read-Only'}[S.au]||'—') : '—');
+  set('rv-au', S.agent ? ({{full:'Full', supervised:'Supervised', readonly:'Read-Only'}}[S.au]||'—') : '—');
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
 }}
 
