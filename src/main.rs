@@ -1391,9 +1391,19 @@ input:checked+.slider{{background:#6366f1}}input:checked+.slider:before{{transfo
         <div id="pc-ollama" class="pc"><div class="info-box">Ollama must be running on this node or local network.</div><label>Ollama URL</label><input type="url" id="pl-url" value="http://127.0.0.1:11434"><label>Model name *</label><input type="text" id="pl-mdl" placeholder="llama3.2"></div>
         <div class="divider"></div>
         <label>Agent autonomy</label>
-        <div class="ao">
-          <div class="ab sel" onclick="sAu('operator',this)"><div class="ar"></div><div><div class="an">⚡ Operator Autonomy <span style="font-size:11px;color:#6366f1;margin-left:6px">Default</span></div><div class="ad">The human directs their agent who has permission to run the commands required to operate the node.</div></div></div>
-          <div class="ab" onclick="sAu('advisor',this)"><div class="ar"></div><div><div class="an">🔒 Advisor Autonomy</div><div class="ad">The agent has read-only access, and the human chooses which commands to manually execute via SSH.</div></div></div>
+        <div class="hw-opts" id="au-opts" style="flex-direction:column">
+            <div class="hw-opt{sel_full}" onclick="selAu('full',this)">
+            <div class="hw-opt-name">⚡ Full</div>
+            <div class="hw-opt-desc">The agent acts autonomously — executes commands and makes decisions without asking for approval first.</div>
+            </div>
+            <div class="hw-opt{sel_supervised}" onclick="selAu('supervised',this)">
+            <div class="hw-opt-name">👁 Supervised</div>
+            <div class="hw-opt-desc">The agent proposes actions and waits for your approval before executing anything.</div>
+            </div>
+            <div class="hw-opt{sel_readonly}" onclick="selAu('readonly',this)">
+            <div class="hw-opt-name">🔒 Read-Only</div>
+            <div class="hw-opt-desc">The agent has read-only access — it can observe and advise but cannot run any commands.</div>
+            </div>
         </div>
         <div class="fw vis" id="fw" style="background:#0f1f2e;border-color:#1e3a5f;color:#93c5fd"><strong>🛡 Risk surface is well contained.</strong> A strict command allowlist is already enforced — <code>curl</code> and <code>wget</code> are blocked. The agent can only write inside <code>/var/lib/zeroclaw/workspace</code> (enforced by <code>allowed_roots</code>) and cannot touch system files (enforced by <code>forbidden_paths</code>).</div>
         <div class="divider"></div>
@@ -1542,7 +1552,7 @@ const CH = {{
 }};
 
 // ── JS state ───────────────────────────────────────────────────────────────────
-const S={{agent:false,ch:'',pv:'ollama',au:'operator'}};
+const S={agent:false,ch:'',pv:'ollama',au:'full'};
 const PVN={{google:'Google Gemini',anthropic:'Anthropic Claude',openai:'OpenAI',openrouter:'OpenRouter',ollama:'Ollama (Local)'}};
 
 // ── Dynamic channel form renderer ─────────────────────────────────────────────
@@ -1643,7 +1653,7 @@ function bRev(){{
   set('rv-ch',S.agent?(CH[S.ch]?CH[S.ch].name:'—'):'—');
   set('rv-pv',S.agent?(PVN[S.pv]||S.pv||'—'):'—');
   set('rv-md',S.agent?(mdl||'(default)'):'—');
-  set('rv-au',S.agent?({{operator:'Operator Autonomy',advisor:'Advisor Autonomy'}}[S.au]||'—'):'—');
+  set('rv-au', S.agent ? ({full:'Full', supervised:'Supervised', readonly:'Read-Only'}[S.au]||'—') : '—');
   set('rv-hw',v('hw')==='WIND_TUNNEL'?'Wind Tunnel':'Standard EdgeNode');
 }}
 
@@ -1724,7 +1734,6 @@ fn build_manage_html(state: &AppState) -> String {
     let hw_mode   = state.hw_mode.lock().unwrap().clone();
     let channel   = state.channel.lock().unwrap().clone();
     let provider  = state.provider.lock().unwrap().clone();
-    let model     = state.model.lock().unwrap().clone();
     let agent_on  = state.agent_enabled.load(Ordering::Relaxed);
     let autonomy = match fs::read_to_string(OPENCLAW_CONFIG) {
         Ok(c) => c.lines()
@@ -1734,14 +1743,19 @@ fn build_manage_html(state: &AppState) -> String {
         Err(_) => "supervised".to_string(),
     };
     let autonomy_display = match autonomy.as_str() {
-        "full" | "supervised" => "Operator",
-        _ => "Advisor",
+    "full"       => "Full",
+    "supervised" => "Supervised",
+    "readonly"   => "Read-Only",
+    _            => "Supervised",
     };
     let au_badge_class = match autonomy.as_str() {
-        "full" | "supervised" => "badge-green",
-        _ => "badge-gray",
+    "full"       => "badge-green",
+    "supervised" => "badge-orange",
+    _            => "badge-gray",
     };
-    let sel_operator = if autonomy == "full" || autonomy == "supervised" { " sel" } else { "" };
+    let sel_full       = if autonomy == "full"       { " sel" } else { "" };
+    let sel_supervised = if autonomy == "supervised" { " sel" } else { "" };
+    let sel_readonly   = if autonomy == "readonly"   { " sel" } else { "" };
     let sel_advisor = if autonomy == "readonly" { " sel" } else { "" };
     let ssh_keys  = read_ssh_keys();
     let uptime_s  = state.start_time.elapsed().unwrap_or_default().as_secs();
@@ -2191,16 +2205,14 @@ function selAu(lvl,el){{
   mAu=lvl;
   document.querySelectorAll('#au-opts .hw-opt').forEach(o=>o.classList.remove('sel'));
   el.classList.add('sel');
-  const info=document.getElementById('au-info');
-  if(info)info.style.display=lvl==='operator'?'block':'none';
 }}
 async function saveAutonomy(){{
-  const levelMap={{operator:'full',advisor:'readonly'}};
-  const nameMap={{operator:'Operator',advisor:'Advisor'}};
+  const nameMap={{full:'Full',supervised:'Supervised',readonly:'Read-Only'}};
   try{{
-    await api('/manage/autonomy',{{level:levelMap[mAu]||mAu}});
+    await api('/manage/autonomy',{{level:mAu}});
     document.getElementById('badge-au').textContent=nameMap[mAu]||mAu;
-    document.getElementById('badge-au').className='section-badge '+(mAu==='operator'?'badge-green':'badge-gray');
+    document.getElementById('badge-au').className='section-badge '+
+      (mAu==='full'?'badge-green':mAu==='supervised'?'badge-orange':'badge-gray');
     toast('Autonomy set to '+(nameMap[mAu]||mAu)+' — agent restarting…',true);
   }}catch(e){{toast('Error: '+e.message,false);}}
 }}
@@ -2271,10 +2283,11 @@ async function triggerUpdate(){{
         autonomy_section_vis = if agent_on { "" } else { "display:none" },
         au_badge_class    = au_badge_class,
         autonomy_display  = autonomy_display,
-        sel_operator         = sel_operator,
-        sel_advisor          = sel_advisor,
-        au_info_vis          = if autonomy == "full" || autonomy == "supervised" { "block" } else { "none" },
-        autonomy_key         = if autonomy == "readonly" { "advisor" } else { "operator" },
+        sel_full          = sel_full,
+        sel_supervised    = sel_supervised,
+        sel_readonly      = sel_readonly,
+        au_info_vis       = if autonomy == "full" || autonomy == "supervised" { "block" } else { "none" },
+        autonomy_key      = &autonomy,
         vis_ollama        = vis("ollama"),
     )
 }
@@ -2298,10 +2311,10 @@ fn handle_submit(
     let api_url   = json_str(body, "apiUrl");
     let hw_mode   = json_str(body, "hwMode");
     let level = match json_str(body, "autonomyLevel") {
-        "operator" | "full"     => "full",
-        "advisor"  | "readonly" => "readonly",
-        _                       => "supervised",
-    };
+    "full"     => "full",
+    "readonly" => "readonly",
+    _          => "supervised",
+};
 
     if node_name.is_empty() { send_json_err(stream, 400, "nodeName is required"); return; }
 
@@ -2698,13 +2711,12 @@ fn handle_autonomy_change(
     }
 
     let display = match level {
-        "readonly"   => "Read-Only",
-        "supervised" => "Supervised",
-        "full"       => "Full Autonomy",
-        _            => level,
-    };
+    "readonly"   => "Read-Only",
+    "supervised" => "Supervised",
+    "full"       => "Full",
+    _            => level,
+};
 
-    // Read current config, extract channel config to reapply
     let config = match fs::read_to_string(OPENCLAW_CONFIG) {
         Ok(c) => c,
         Err(e) => {
@@ -2714,12 +2726,11 @@ fn handle_autonomy_change(
             return;
         }
     };
-    let channel_config = extract_channel_config(&config);
 
-    // Patch config with new autonomy level
-    let mut final_config = patch_openclaw_config(&config, level);
-    final_config.push('\n');
-    final_config.push_str(&channel_config);
+    // patch_openclaw_config rewrites `level = "..."` in-place and passes channel
+    // sections through unchanged — no extract/reappend needed here (unlike the
+    // onboard/provider flows that call run_openclaw_onboard which wipes the file).
+    let final_config = patch_openclaw_config(&config, level);
 
     if let Err(e) = fs::write(OPENCLAW_CONFIG, &final_config) {
         let msg = format!("failed to write config: {}", e);
@@ -2729,7 +2740,6 @@ fn handle_autonomy_change(
     }
     let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
 
-    // Restart agent if it's running
     if state.agent_enabled.load(Ordering::Relaxed) {
         let _ = Command::new("systemctl").args(["restart", "openclaw-daemon.service"]).output();
     }
