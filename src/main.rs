@@ -1726,7 +1726,7 @@ async function doSubmit(){{
 </script>
 </body></html>"#,
         css        = COMMON_CSS,
-        wifi_block = wifi_block),
+        wifi_block = wifi_block,
         sel_full       = " sel",   
         sel_supervised = "",
         sel_readonly   = "",
@@ -2534,7 +2534,6 @@ fn handle_submit(
             send_json_err(stream, 500, &format!("failed to write config: {}", e)); return;
         }
         let _ = Command::new("chmod").args(["600", OPENCLAW_CONFIG]).output();
-        let after = snapshot_config();
 
         let _ = fs::write(PROVIDER_FILE, format!(
             "provider={}\nmodel={}\napi_key={}\napi_url={}\n",
